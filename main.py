@@ -1,193 +1,248 @@
-import logging
-import asyncio
-import random
 import os
+import logging
+import sqlite3
 
-from datetime import datetime
+from aiogram import Bot, Dispatcher, Router
+from aiogram.types import Message
+from aiogram.filters import Command
 from dotenv import load_dotenv
 
-from database import (
-    init_db,
-    add_user,
-    set_active,
-    get_users,
-    delete_user,
-    save_meeting,
-    last_meeting_days_ago,
-    get_stats
-)
-
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-
-
-# ---------- ENV ----------
+# -----------------------------
+# INIT
+# -----------------------------
 load_dotenv()
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-logging.basicConfig(level=logging.INFO)
-print("🔥 LEVEL 5 SOCIAL ENGINE STARTED")
-
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN missing")
+    raise ValueError("BOT_TOKEN is missing in environment variables")
 
+ADMIN_ID = 123456789  # <-- вставь свой Telegram ID
+
+logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+router = Router()
+admin_router = Router()
 
-ICEBREAKERS = [
-    "Какой город идеально подходит для одного ristretto?",
-    "Какой рабочий ритуал ты никому не отдашь?",
-    "Какой проект дал неожиданный инсайт?",
-    "Что в работе ты считаешь недооценённым?",
-    "Какой внутренний мем должен жить вечно?"
-]
-
-
-keyboard = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="Да ☕️", callback_data="yes")],
-    [InlineKeyboardButton(text="Пауза", callback_data="no")]
-])
+# -----------------------------
+# DB
+# -----------------------------
+DB_PATH = "ristretto.db"
 
 
-# ---------- USER ----------
-@dp.message(Command("start"))
-async def start(message: Message):
-    add_user(
-        message.from_user.id,
-        message.from_user.username,
-        message.from_user.first_name
+def db():
+    return sqlite3.connect(DB_PATH)
+
+
+def init_db():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            active INTEGER DEFAULT 1
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def add_user(user_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO users (user_id, active) VALUES (?, 1)",
+        (user_id,)
     )
+    conn.commit()
+    conn.close()
 
-    set_active(message.from_user.id, True)
+
+def get_users():
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, active FROM users")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def set_active(user_id: int, active: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE users SET active=? WHERE user_id=?",
+        (active, user_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_user(user_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM users WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+# -----------------------------
+# HELPERS
+# -----------------------------
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+
+# -----------------------------
+# USER HANDLERS
+# -----------------------------
+@router.message(Command("start"))
+async def start(message: Message):
+    add_user(message.from_user.id)
 
     await message.answer(
-        "☕️ Ristretto Level 5\n"
-        "Ты в системе.\n"
-        "/stats — аналитика\n"
-        "/match_now — запуск матча\n"
-        "/leave — пауза\n"
-        "/delete_me — удаление"
+        "☕️ Random Ristretto\n"
+        "Короткие разговоры. Сильный кофе.\n\n"
+        "Я буду предлагать тебе случайные встречи раз в 2 недели."
     )
 
 
-@dp.message(Command("leave"))
-async def leave(message: Message):
-    set_active(message.from_user.id, False)
-    await message.answer("⏸ пауза")
+@router.message(Command("pause"))
+async def pause(message: Message):
+    set_active(message.from_user.id, 0)
+    await message.answer("☕️ You are paused")
 
 
-@dp.message(Command("delete_me"))
+@router.message(Command("resume"))
+async def resume(message: Message):
+    set_active(message.from_user.id, 1)
+    await message.answer("☕️ You are back in the flow")
+
+
+@router.message(Command("delete_me"))
 async def delete_me(message: Message):
     delete_user(message.from_user.id)
-    await message.answer("🗑 удалено")
+    await message.answer("☕️ Your profile was deleted")
 
 
-# ---------- ADMIN ANALYTICS ----------
-@dp.message(Command("stats"))
-async def stats(message: Message):
-    data = get_stats()
+# -----------------------------
+# FALLBACK (catch-all)
+# -----------------------------
+@router.message()
+async def fallback(message: Message):
+    await message.answer("☕️ I didn't understand that. Try /start or /admin")
+
+
+# -----------------------------
+# ADMIN
+# -----------------------------
+@admin_router.message(Command("admin"))
+async def admin_panel(message: Message):
+    if not is_admin(message.from_user.id):
+        return
 
     await message.answer(
-        "📊 SOCIAL ENGINE STATS\n\n"
-        f"👥 users: {data['users']}\n"
-        f"⚡ active: {data['active']}\n"
-        f"☕ meetings: {data['meetings']}\n"
-        f"🔥 avg inactivity: {data['avg_inactivity']}"
+        "☕️ ADMIN PANEL\n\n"
+        "/stats\n"
+        "/users\n"
+        "/pause_user <id>\n"
+        "/resume_user <id>\n"
+        "/delete_user <id>"
     )
 
 
-# ---------- MANUAL TRIGGER ----------
-@dp.message(Command("match_now"))
-async def match_now(message: Message):
-    await run_match()
-    await message.answer("☕️ матч выполнен")
+@admin_router.message(Command("stats"))
+async def stats(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    users = get_users()
+    active = sum(1 for u in users if u[1] == 1)
+
+    await message.answer(
+        f"☕️ STATS\n\n"
+        f"Total users: {len(users)}\n"
+        f"Active users: {active}"
+    )
 
 
-# ---------- CALLBACKS ----------
-@dp.callback_query(F.data == "yes")
-async def yes(call: CallbackQuery):
-    set_active(call.from_user.id, True)
-    await call.message.edit_text("☕️ активен")
-    await call.answer()
+@admin_router.message(Command("users"))
+async def users_list(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    users = get_users()[:30]
+
+    text = "☕️ USERS\n\n"
+    for u in users:
+        text += f"{u[0]} | active={u[1]}\n"
+
+    await message.answer(text)
 
 
-@dp.callback_query(F.data == "no")
-async def no(call: CallbackQuery):
-    set_active(call.from_user.id, False)
-    await call.message.edit_text("⏸ пауза")
-    await call.answer()
+@admin_router.message(Command("pause_user"))
+async def pause_user(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    try:
+        user_id = int(message.text.split()[1])
+        set_active(user_id, 0)
+        await message.answer(f"☕️ paused {user_id}")
+    except:
+        await message.answer("Usage: /pause_user <id>")
 
 
-# ---------- MATCH ENGINE ----------
-async def run_match():
-    users = get_users(active_only=True)
-    random.shuffle(users)
+@admin_router.message(Command("resume_user"))
+async def resume_user(message: Message):
+    if not is_admin(message.from_user.id):
+        return
 
-    pairs = []
-    used = set()
-
-    users.sort(key=lambda u: last_meeting_days_ago(u[0], u[0]), reverse=True)
-
-    while len(users) > 1:
-        a = users.pop(0)
-
-        best = None
-        best_score = -1
-
-        for i, b in enumerate(users):
-            score = last_meeting_days_ago(a[0], b[0])
-
-            if score > best_score:
-                best_score = score
-                best = i
-
-        if best is None:
-            b = users.pop(0)
-        else:
-            b = users.pop(best)
-
-        pairs.append((a, b))
-
-    if users:
-        pairs.append((users.pop(),))
-
-    for pair in pairs:
-        topic = random.choice(ICEBREAKERS)
-
-        if len(pair) == 2:
-            save_meeting(pair[0][0], pair[1][0])
-
-        for u in pair:
-            try:
-                await bot.send_message(
-                    u[0],
-                    f"☕️ Ristretto match\n\n{topic}"
-                )
-            except:
-                pass
+    try:
+        user_id = int(message.text.split()[1])
+        set_active(user_id, 1)
+        await message.answer(f"☕️ resumed {user_id}")
+    except:
+        await message.answer("Usage: /resume_user <id>")
 
 
-# ---------- SCHEDULER ----------
-async def scheduler():
-    while True:
-        now = datetime.now()
+@admin_router.message(Command("delete_user"))
+async def delete_user_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        return
 
-        if now.weekday() == 0 and now.hour == 11 and now.minute == 0:
-            await run_match()
+    try:
+        user_id = int(message.text.split()[1])
+        delete_user(user_id)
+        await message.answer(f"☕️ deleted {user_id}")
+    except:
+        await message.answer("Usage: /delete_user <id>")
 
-        await asyncio.sleep(30)
 
-
-# ---------- MAIN ----------
-async def main():
-    print("Bot running ☕️")
+# -----------------------------
+# STARTUP
+# -----------------------------
+async def on_startup():
     init_db()
-    asyncio.create_task(scheduler())
+    print("☕️ Random Ristretto started")
+
+
+# -----------------------------
+# MAIN
+# -----------------------------
+async def main():
+    dp.include_router(router)
+    dp.include_router(admin_router)
+
+    await on_startup()
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
