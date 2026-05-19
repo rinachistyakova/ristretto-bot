@@ -1,0 +1,5 @@
+.env
+ristretto.db
+users.json
+__pycache__/
+*.pyc
