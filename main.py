@@ -5,6 +5,7 @@ import logging
 import asyncio
 import random
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -29,6 +30,7 @@ if not DATABASE_URL:
     raise ValueError("DATABASE_URL missing")
 
 ADMIN_ID = 75734295
+TZ = ZoneInfo("Europe/Istanbul")
 
 # -----------------------------
 # LOGGING
@@ -328,7 +330,7 @@ async def loop():
 
     while True:
 
-        now = datetime.now()
+        now = datetime.now(TZ)
 
         if now.weekday() == 0 and now.hour == 10:
             await checkin()
