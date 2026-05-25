@@ -326,16 +326,48 @@ async def no(c: CallbackQuery):
 # -----------------------------
 # LOOP
 # -----------------------------
+_scheduler_started = False
+
 async def loop():
+
+    global _scheduler_started
+
+    if _scheduler_started:
+        return
+
+    _scheduler_started = True
+
+    last_checkin_day = None
+    last_match_day = None
 
     while True:
 
         now = datetime.now(TZ)
 
-        if now.weekday() == 0 and now.hour == 10:
+        # Monday 10:00
+        if (
+            now.weekday() == 0
+            and now.hour == 10
+            and last_checkin_day != now.date()
+        ):
+
+            last_checkin_day = now.date()
+
+            print("☕️ sending weekly checkin")
+
             await checkin()
 
-        if now.weekday() == 1 and now.hour == 11:
+        # Tuesday 11:00
+        if (
+            now.weekday() == 1
+            and now.hour == 11
+            and last_match_day != now.date()
+        ):
+
+            last_match_day = now.date()
+
+            print("☕️ running matching")
+
             await match()
 
         await asyncio.sleep(60)
