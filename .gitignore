@@ -1,5 +1,12 @@
 .env
+
 ristretto.db
+
 users.json
-__pycache__/
+
+**pycache**/
+
 *.pyc
+
+.venv/
+.DS_Store
