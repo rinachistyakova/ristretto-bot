@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo
 import asyncpg
 from dotenv import load_dotenv
 
+from v2_foundation import ensure_v2_foundation
+
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command
@@ -269,6 +271,10 @@ async def init_db() -> None:
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_confirmed_cycle ON users(confirmed_cycle)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_match_groups_cycle ON match_groups(cycle_key)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_thanks_cycle ON thanks(cycle_key)")
+
+        # Random Ristretto v2: additive foundation only.
+        # This does not switch the current user-facing UX to v2 yet.
+        await ensure_v2_foundation(conn, ADMIN_ID)
 
 
 async def get_user(user_id: int):
