@@ -1,4 +1,4 @@
-print("RUNNING FILE: MAIN.PY V2 PROFILES + MATCHING + THANKS")
+print("RUNNING FILE: MAIN.PY V2 PROFILES + MATCHING + THANKS + ADMIN")
 
 import asyncio
 import logging
@@ -39,6 +39,7 @@ if not DATABASE_URL:
     raise ValueError("DATABASE_URL missing")
 
 ADMIN_ID = 75734295
+ADMIN_USER_IDS: set[int] = {ADMIN_ID}
 TZ = ZoneInfo("Europe/Istanbul")
 
 # Понедельник = 0, вторник = 1, среда = 2, пятница = 4
@@ -77,7 +78,29 @@ ICEBREAKERS = [
 # ОБЩИЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # =========================================================
 def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_USER_IDS
+
+
+def is_owner(user_id: int) -> bool:
     return user_id == ADMIN_ID
+
+
+async def refresh_admin_cache() -> None:
+    global ADMIN_USER_IDS
+    if pool is None:
+        ADMIN_USER_IDS = {ADMIN_ID}
+        return
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT user_id
+            FROM users
+            WHERE role IN ('owner', 'admin')
+              AND status='active'
+              AND deleted_at IS NULL
+              AND removed_by_admin=0
+        """)
+    ADMIN_USER_IDS = {ADMIN_ID, *(row["user_id"] for row in rows)}
 
 
 def current_cycle(moment: datetime | None = None) -> str:
@@ -168,6 +191,13 @@ async def require_admin(message: Message) -> bool:
     if is_admin(message.from_user.id):
         return True
     await message.answer("Эта команда доступна только администратору.")
+    return False
+
+
+async def require_owner(message: Message) -> bool:
+    if is_owner(message.from_user.id):
+        return True
+    await message.answer("Эта команда доступна только владельцу бота.")
     return False
 
 # =========================================================
@@ -314,6 +344,8 @@ async def init_db() -> None:
         # This does not switch the current user-facing UX to v2 yet.
         await ensure_v2_foundation(conn, ADMIN_ID)
         await backfill_match_relationships(conn)
+
+    await refresh_admin_cache()
 
 
 async def get_user(user_id: int):
@@ -1226,6 +1258,16 @@ async def finish_profile_after_responsibility(message: Message, user_id: int, te
         return
 
     if user["status"] == "pending_activation":
+        if user_before["access_denied_reason"] == "admin_restore_pending":
+            activated = await activate_pending_user(user_id)
+            if activated:
+                await message.answer(
+                    "Профиль обновлён. Доступ снова открыт.\n\n"
+                    "По понедельникам я буду спрашивать про Ristretto, "
+                    "по средам — напоминать про благодарности."
+                )
+                return
+
         await message.answer(
             "Профиль готов.\n"
             "Скоро админ активирует твой профиль — и ты в Ristretto."
@@ -1489,6 +1531,14 @@ async def admin_activate_callback(callback: CallbackQuery) -> None:
         await callback.answer("Профиль уже обработан.", show_alert=True)
         return
 
+    await audit_admin_action(
+        callback.from_user.id,
+        "activate_user",
+        target_user_id=user_id,
+        object_type="user",
+        object_id=user_id,
+    )
+
     await callback.message.edit_text(
         f"Доступ открыт: {clean_name(user['display_name'])}"
     )
@@ -1523,6 +1573,14 @@ async def admin_deny_activation_callback(callback: CallbackQuery) -> None:
     if not denied:
         await callback.answer("Профиль уже обработан.", show_alert=True)
         return
+
+    await audit_admin_action(
+        callback.from_user.id,
+        "deny_activation",
+        target_user_id=user_id,
+        object_type="user",
+        object_id=user_id,
+    )
 
     await callback.message.edit_text(
         f"Доступ не открыт: {clean_name(user['display_name'])}"
@@ -3170,6 +3228,9 @@ async def moderate_public_thanks(
                 VALUES ($1, $2, $3, 'thanks', $4, '{}'::jsonb, NOW())
             """, admin_id, audit_action, row["sender_id"], thanks_id)
 
+    if action == "revoke":
+        await refresh_admin_cache()
+
     if action == "keep":
         return True, "Оставлено в пятничных хайлайтах."
     if action == "remove":
@@ -3853,33 +3914,227 @@ async def thanks_digest_now_command(message: Message) -> None:
 
 
 # =========================================================
-# АДМИНИСТРАТОР: ПОЛЬЗОВАТЕЛИ
+# АДМИНИСТРАТОР V2: РОЛИ, ДАШБОРД, ПОЛЬЗОВАТЕЛИ И АУДИТ
 # =========================================================
+ADMIN_STATUS_LABELS = {
+    "active": "активен",
+    "paused": "пауза",
+    "pending_activation": "ждёт активации",
+    "access_denied": "доступ закрыт",
+    "self_deleted": "удалил профиль",
+}
+
+
+def admin_status_label(user: asyncpg.Record | dict) -> str:
+    return ADMIN_STATUS_LABELS.get(user["status"], user["status"] or "неизвестно")
+
+
+def admin_home_keyboard(owner: bool) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="Пользователи", callback_data="admin_users_menu")],
+        [InlineKeyboardButton(text="Ждут активации", callback_data="admin_pending_menu")],
+        [InlineKeyboardButton(text="Активность недели", callback_data="admin_week_activity")],
+        [InlineKeyboardButton(text="Блокировки", callback_data="admin_blocks_menu")],
+        [InlineKeyboardButton(text="Пятничные хайлайты", callback_data="admin_highlights_menu")],
+        [InlineKeyboardButton(text="Доступ закрыт", callback_data="admin_denied_menu")],
+        [InlineKeyboardButton(text="Удалили профиль", callback_data="admin_deleted_menu")],
+    ]
+    if owner:
+        rows.extend([
+            [InlineKeyboardButton(text="Администраторы", callback_data="admin_roles_menu")],
+            [InlineKeyboardButton(text="Аудит", callback_data="admin_audit_menu")],
+            [InlineKeyboardButton(text="Состояние бота", callback_data="admin_bot_state")],
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def get_admin_dashboard_counts(cycle_key: str) -> dict:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        return {
+            "active": await conn.fetchval("SELECT COUNT(*) FROM users WHERE status='active' AND active=1 AND deleted_at IS NULL AND removed_by_admin=0"),
+            "paused": await conn.fetchval("SELECT COUNT(*) FROM users WHERE status='paused' AND deleted_at IS NULL"),
+            "pending": await conn.fetchval("SELECT COUNT(*) FROM users WHERE status='pending_activation' AND onboarding_step='completed'"),
+            "denied": await conn.fetchval("SELECT COUNT(*) FROM users WHERE status='access_denied'"),
+            "deleted": await conn.fetchval("SELECT COUNT(*) FROM users WHERE status='self_deleted' OR deleted_at IS NOT NULL"),
+            "ristretto": await conn.fetchval("SELECT COUNT(*) FROM weekly_participation WHERE cycle_key=$1 AND response='yes'", cycle_key),
+            "thanks": await conn.fetchval("SELECT COUNT(*) FROM thanks WHERE cycle_key=$1", cycle_key),
+            "public": await conn.fetchval("SELECT COUNT(*) FROM thanks WHERE cycle_key=$1 AND include_in_digest=1 AND public_status NOT IN ('removed','cancelled')", cycle_key),
+            "new_blocks": await conn.fetchval("SELECT COUNT(*) FROM thanks_blocks WHERE created_at >= date_trunc('week', NOW())"),
+        }
+
+
+async def send_admin_home(message: Message, user_id: int) -> None:
+    cycle_key = current_cycle()
+    counts = await get_admin_dashboard_counts(cycle_key)
+    role = "owner" if is_owner(user_id) else "admin"
+    await message.answer(
+        "Random Ristretto · админка\n\n"
+        f"Роль: {role}\n"
+        f"Неделя: {cycle_key}\n"
+        f"Активных: {counts['active']} · на паузе: {counts['paused']}\n"
+        f"Ждут активации: {counts['pending']} · доступ закрыт: {counts['denied']}\n"
+        f"Ristretto: {counts['ristretto']} участников\n"
+        f"Благодарности: {counts['thanks']} · публичные: {counts['public']}\n"
+        f"Новых блокировок: {counts['new_blocks']}",
+        reply_markup=admin_home_keyboard(is_owner(user_id)),
+    )
+
+
+@router.message(Command("admin"))
+async def admin_command(message: Message) -> None:
+    if not await require_admin(message):
+        return
+    await send_admin_home(message, message.from_user.id)
+
+
+@router.callback_query(F.data == "admin_home")
+async def admin_home_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    await send_admin_home(callback.message, callback.from_user.id)
+    await callback.answer()
+
+
+async def get_admin_user_metrics(user_id: int, cycle_key: str) -> dict:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        return {
+            "this_week": await conn.fetchval(
+                "SELECT response FROM weekly_participation WHERE user_id=$1 AND cycle_key=$2",
+                user_id, cycle_key,
+            ),
+            "weeks": await conn.fetchval(
+                "SELECT COUNT(*) FROM weekly_participation WHERE user_id=$1 AND response='yes'",
+                user_id,
+            ),
+            "thanks_week": await conn.fetchval(
+                "SELECT COUNT(*) FROM thanks WHERE sender_id=$1 AND cycle_key=$2",
+                user_id, cycle_key,
+            ),
+            "thanks_total": await conn.fetchval(
+                "SELECT COUNT(*) FROM thanks WHERE sender_id=$1",
+                user_id,
+            ),
+            "active_blocks": await conn.fetchval(
+                "SELECT COUNT(*) FROM thanks_blocks WHERE blocked_sender_id=$1 AND unblocked_at IS NULL",
+                user_id,
+            ),
+        }
+
+
+async def send_admin_user_card(message: Message, user_id: int, viewer_id: int) -> None:
+    user = await get_user(user_id)
+    if not user:
+        await message.answer("Пользователь не найден.")
+        return
+
+    cycle_key = current_cycle()
+    metrics = await get_admin_user_metrics(user_id, cycle_key)
+    username = f"@{user['username']}" if user["username"] else "username отсутствует"
+    team = team_label(user["team"]) or "другая / не указана"
+    responsibility = (user["responsibility_text"] or "").strip() or "не заполнено"
+    created = user["created_at"].strftime("%d.%m.%Y") if user["created_at"] else "—"
+    response = {"yes": "участвует", "no": "пропускает", None: "не ответил"}.get(metrics["this_week"], "—")
+
+    buttons = []
+    if user["status"] == "access_denied":
+        buttons.append([InlineKeyboardButton(text="Вернуть доступ", callback_data=f"admin_restore:{user_id}")])
+    elif user_id != ADMIN_ID and user["status"] not in {"self_deleted"}:
+        buttons.append([InlineKeyboardButton(text="Закрыть доступ", callback_data=f"admin_remove:{user_id}")])
+
+    if is_owner(viewer_id) and user_id != ADMIN_ID and user["status"] == "active" and user["active"] == 1:
+        if user["role"] == "admin":
+            buttons.append([InlineKeyboardButton(text="Убрать роль администратора", callback_data=f"admin_role_remove:{user_id}")])
+        elif user["role"] == "user":
+            buttons.append([InlineKeyboardButton(text="Сделать администратором", callback_data=f"admin_role_add:{user_id}")])
+
+    await message.answer(
+        "Карточка пользователя\n\n"
+        f"{profile_title(user)}\n"
+        f"Telegram: {username}\n"
+        f"Отвечает за: {responsibility}\n"
+        f"Команда: {team}\n"
+        f"Статус: {admin_status_label(user)}\n"
+        f"Роль: {user['role']}\n"
+        f"Регистрация: {created}\n\n"
+        f"Эта неделя: {response}\n"
+        f"Участий в Ristretto: {metrics['weeks']}\n"
+        f"Спасибо отправлено: {metrics['thanks_week']} на этой неделе / {metrics['thanks_total']} всего\n"
+        f"Активных блокировок против пользователя: {metrics['active_blocks']}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None,
+    )
+
+
+async def send_users_list(message: Message, statuses: tuple[str, ...] | None = None) -> None:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        if statuses:
+            users = await conn.fetch("""
+                SELECT * FROM users
+                WHERE status = ANY($1::text[])
+                ORDER BY LOWER(COALESCE(display_name, username, '')), user_id
+            """, list(statuses))
+        else:
+            users = await conn.fetch("""
+                SELECT * FROM users
+                WHERE status <> 'self_deleted'
+                ORDER BY LOWER(COALESCE(display_name, username, '')), user_id
+            """)
+
+    if not users:
+        await message.answer("В этом разделе пока никого нет.")
+        return
+
+    rows = [
+        [InlineKeyboardButton(
+            text=f"{clean_name(user['display_name'])} · {admin_status_label(user)}"[:60],
+            callback_data=f"admin_user:{user['user_id']}",
+        )]
+        for user in users
+    ]
+    rows.append([InlineKeyboardButton(text="← В админку", callback_data="admin_home")])
+    await message.answer("Пользователи:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
 @router.message(Command("users"))
 async def users_command(message: Message) -> None:
     if not await require_admin(message):
         return
+    await send_users_list(message)
 
-    users = await get_visible_users_for_admin()
-    if not users:
-        await message.answer("В боте нет пользователей.")
+
+@router.callback_query(F.data == "admin_users_menu")
+async def admin_users_menu_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
         return
+    await send_users_list(callback.message)
+    await callback.answer()
 
-    rows = []
-    for user in users:
-        status = "активен" if user["active"] == 1 else "пауза"
-        label = f"{clean_name(user['display_name'])} · {status}"
-        rows.append([
-            InlineKeyboardButton(
-                text=label[:60],
-                callback_data=f"admin_user:{user['user_id']}",
+
+@router.callback_query(F.data == "admin_pending_menu")
+async def admin_pending_menu_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    users = await get_pending_activation_users()
+    if not users:
+        await callback.message.answer("Сейчас никто не ждёт активации.")
+    else:
+        for user in users:
+            username = f"@{user['username']}" if user["username"] else "username отсутствует"
+            team = team_label(user["team"]) or "Другая команда"
+            await callback.message.answer(
+                "Профиль ждёт активации\n\n"
+                f"{clean_name(user['display_name'])}\n"
+                f"Команда: {team}\n"
+                f"Отвечает за: {(user['responsibility_text'] or '').strip()}\n"
+                f"Telegram: {username}",
+                reply_markup=pending_activation_keyboard(user["user_id"]),
             )
-        ])
-
-    await message.answer(
-        "Выберите пользователя:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("admin_user:"))
@@ -3887,31 +4142,8 @@ async def admin_user_callback(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет доступа.", show_alert=True)
         return
-
     user_id = int(callback.data.split(":", 1)[1])
-    user = await get_user(user_id)
-    if not user or user["deleted_at"] is not None:
-        await callback.answer("Пользователь уже удалён.", show_alert=True)
-        return
-
-    username = f"@{user['username']}" if user["username"] else "username отсутствует"
-    status = "активен" if user["active"] == 1 else "на паузе"
-
-    buttons = []
-    if user_id != ADMIN_ID:
-        buttons.append([
-            InlineKeyboardButton(
-                text="Удалить из бота",
-                callback_data=f"admin_remove:{user_id}",
-            )
-        ])
-
-    await callback.message.answer(
-        f"Имя: {clean_name(user['display_name'])}\n"
-        f"Telegram: {username}\n"
-        f"Статус: {status}",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None,
-    )
+    await send_admin_user_card(callback.message, user_id, callback.from_user.id)
     await callback.answer()
 
 
@@ -3923,23 +4155,19 @@ async def admin_remove_callback(callback: CallbackQuery) -> None:
 
     user_id = int(callback.data.split(":", 1)[1])
     user = await get_user(user_id)
-    if not user or user["deleted_at"] is not None:
-        await callback.answer("Пользователь уже удалён.", show_alert=True)
+    if not user or user["status"] == "self_deleted":
+        await callback.answer("Пользователь недоступен.", show_alert=True)
+        return
+    if user_id == ADMIN_ID:
+        await callback.answer("Нельзя закрыть доступ владельцу.", show_alert=True)
         return
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(
-                text="Да, удалить",
-                callback_data=f"admin_remove_confirm:{user_id}",
-            )],
-            [InlineKeyboardButton(text="Отмена", callback_data="admin_remove_cancel")],
-        ]
-    )
-
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Да, закрыть доступ", callback_data=f"admin_remove_confirm:{user_id}")],
+        [InlineKeyboardButton(text="Отмена", callback_data="admin_remove_cancel")],
+    ])
     await callback.message.answer(
-        f"Удалить {clean_name(user['display_name'])} из бота?\n\n"
-        "Пользователь перестанет получать рассылки и исчезнет из новых списков.",
+        f"Закрыть доступ для {clean_name(user['display_name'])}?",
         reply_markup=keyboard,
     )
     await callback.answer()
@@ -3954,9 +4182,15 @@ async def admin_remove_confirm_callback(callback: CallbackQuery) -> None:
     user_id = int(callback.data.split(":", 1)[1])
     removed = await remove_user_by_admin(user_id)
     if removed:
-        await callback.message.edit_text("Пользователь удалён из активной базы бота.")
+        await audit_admin_action(callback.from_user.id, "revoke_access", user_id, "user", user_id)
+        await refresh_admin_cache()
+        await callback.message.edit_text("Доступ пользователю закрыт.")
+        try:
+            await bot.send_message(user_id, access_denied_message())
+        except Exception:
+            logging.exception("Не удалось сообщить пользователю о закрытии доступа")
     else:
-        await callback.message.edit_text("Не удалось удалить пользователя.")
+        await callback.message.edit_text("Не удалось закрыть доступ пользователю.")
     await callback.answer()
 
 
@@ -3965,7 +4199,304 @@ async def admin_remove_cancel_callback(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет доступа.", show_alert=True)
         return
-    await callback.message.edit_text("Удаление отменено.")
+    await callback.message.edit_text("Действие отменено.")
+    await callback.answer()
+
+
+async def restore_denied_user(user_id: int) -> bool:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        result = await conn.execute("""
+            UPDATE users
+            SET status='pending_activation',
+                active=0,
+                removed_by_admin=0,
+                name_confirmed=0,
+                team=NULL,
+                responsibility_text=NULL,
+                onboarding_step='name',
+                profile_migration_required=0,
+                access_denied_reason='admin_restore_pending',
+                access_denied_at=NULL,
+                updated_at=NOW()
+            WHERE user_id=$1
+              AND status='access_denied'
+        """, user_id)
+    return result.endswith("1")
+
+
+@router.callback_query(F.data.startswith("admin_restore:"))
+async def admin_restore_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    user_id = int(callback.data.split(":", 1)[1])
+    restored = await restore_denied_user(user_id)
+    if not restored:
+        await callback.answer("Статус уже изменился.", show_alert=True)
+        return
+
+    await audit_admin_action(callback.from_user.id, "restore_access", user_id, "user", user_id)
+    await callback.message.answer("Пользователь переведён на восстановление доступа.")
+    try:
+        await bot.send_message(
+            user_id,
+            "Ты можешь вернуться к Random Ristretto.\n\n"
+            "Для начала обновим профиль — всего три коротких шага.\n\n"
+            "Отправь /start.",
+        )
+    except Exception:
+        logging.exception("Не удалось сообщить пользователю о восстановлении доступа")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_denied_menu")
+async def admin_denied_menu_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    await send_users_list(callback.message, ("access_denied",))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_deleted_menu")
+async def admin_deleted_menu_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    assert pool is not None
+    async with pool.acquire() as conn:
+        users = await conn.fetch("""
+            SELECT user_id, display_name, deleted_at
+            FROM users
+            WHERE status='self_deleted' OR deleted_at IS NOT NULL
+            ORDER BY deleted_at DESC NULLS LAST, user_id
+        """)
+    if not users:
+        await callback.message.answer("Никто не удалял профиль.")
+    else:
+        lines = ["Удалили профиль"]
+        for user in users:
+            when = user["deleted_at"].strftime("%d.%m.%Y") if user["deleted_at"] else "—"
+            lines.append(f"• {clean_name(user['display_name'])} · {when}")
+        await callback.message.answer("\n".join(lines))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_week_activity")
+async def admin_week_activity_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    cycle_key = current_cycle()
+    stats = await get_stats(cycle_key)
+    assert pool is not None
+    async with pool.acquire() as conn:
+        senders = await conn.fetchval("SELECT COUNT(DISTINCT sender_id) FROM thanks WHERE cycle_key=$1", cycle_key)
+        removed = await conn.fetchval("SELECT COUNT(*) FROM thanks WHERE cycle_key=$1 AND public_status='removed'", cycle_key)
+    await callback.message.answer(
+        "Активность недели\n\n"
+        f"Неделя: {cycle_key}\n"
+        f"Ristretto: {stats['confirmed']} участников\n"
+        f"Пар/троек: {stats['groups_week']}\n"
+        f"Благодарности: {stats['thanks_week']} от {senders} пользователей\n"
+        f"Публичные: {stats['thanks_public_week']}\n"
+        f"Удалено модерацией из публичного выпуска: {removed}"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_blocks_menu")
+async def admin_blocks_menu_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    assert pool is not None
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT u.user_id, u.display_name,
+                   COUNT(*) FILTER (WHERE b.unblocked_at IS NULL) AS active_count,
+                   COUNT(*) AS ever_count
+            FROM thanks_blocks b
+            JOIN users u ON u.user_id=b.blocked_sender_id
+            GROUP BY u.user_id, u.display_name
+            ORDER BY active_count DESC, ever_count DESC, LOWER(COALESCE(u.display_name, ''))
+        """)
+    if not rows:
+        await callback.message.answer("Блокировок пока не было.")
+    else:
+        buttons = [[InlineKeyboardButton(
+            text=f"{clean_name(row['display_name'])} · активных {row['active_count']} / всего {row['ever_count']}"[:60],
+            callback_data=f"admin_blocks_user:{row['user_id']}",
+        )] for row in rows]
+        await callback.message.answer("Блокировки по отправителям:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_blocks_user:"))
+async def admin_blocks_user_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    sender_id = int(callback.data.split(":", 1)[1])
+    sender = await get_user(sender_id)
+    assert pool is not None
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT blocker.display_name, b.created_at, b.unblocked_at
+            FROM thanks_blocks b
+            JOIN users blocker ON blocker.user_id=b.blocker_id
+            WHERE b.blocked_sender_id=$1
+            ORDER BY b.created_at DESC
+        """, sender_id)
+    lines = [f"Кто блокировал: {clean_name(sender['display_name']) if sender else sender_id}"]
+    for row in rows:
+        state = "активна" if row["unblocked_at"] is None else "снята"
+        lines.append(f"• {clean_name(row['display_name'])} · {state}")
+    await callback.message.answer("\n".join(lines))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_highlights_menu")
+async def admin_highlights_menu_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    cycle_key = current_cycle()
+    await ensure_digest_run(cycle_key)
+    status = await get_digest_status(cycle_key) or "draft"
+    pending = await get_pending_public_moderation(cycle_key)
+    await callback.message.answer(
+        f"Пятничные хайлайты · {cycle_key}\n\n"
+        f"Статус: {status}\n"
+        f"Ждут модерации: {len(pending)}",
+        reply_markup=digest_review_keyboard(cycle_key, status),
+    )
+    await callback.answer()
+
+
+async def set_user_role(target_user_id: int, role: str, actor_id: int) -> tuple[bool, str]:
+    if role not in {"user", "admin"}:
+        return False, "Неизвестная роль."
+    if not is_owner(actor_id):
+        return False, "Только владелец может менять администраторов."
+    if target_user_id == ADMIN_ID:
+        return False, "Роль владельца изменить нельзя."
+
+    assert pool is not None
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            target = await conn.fetchrow("SELECT * FROM users WHERE user_id=$1 FOR UPDATE", target_user_id)
+            if not target:
+                return False, "Пользователь не найден."
+            if target["status"] != "active" or target["active"] != 1 or target["deleted_at"] is not None:
+                return False, "Администратором можно сделать только активного пользователя."
+            if target["role"] == role:
+                return False, "Эта роль уже установлена."
+            await conn.execute("UPDATE users SET role=$2, updated_at=NOW() WHERE user_id=$1", target_user_id, role)
+            await conn.execute("""
+                INSERT INTO admin_audit_log (
+                    admin_user_id, action, target_user_id, object_type, object_id, metadata, created_at
+                ) VALUES ($1, $2, $3, 'user', $3, '{}'::jsonb, NOW())
+            """, actor_id, "add_admin" if role == "admin" else "remove_admin", target_user_id)
+    await refresh_admin_cache()
+    return True, "Роль администратора добавлена." if role == "admin" else "Роль администратора снята."
+
+
+@router.callback_query(F.data == "admin_roles_menu")
+async def admin_roles_menu_callback(callback: CallbackQuery) -> None:
+    if not is_owner(callback.from_user.id):
+        await callback.answer("Только для владельца.", show_alert=True)
+        return
+    assert pool is not None
+    async with pool.acquire() as conn:
+        admins = await conn.fetch("""
+            SELECT user_id, display_name, role
+            FROM users
+            WHERE role IN ('owner', 'admin')
+            ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END, LOWER(COALESCE(display_name, ''))
+        """)
+        candidates = await conn.fetch("""
+            SELECT user_id, display_name
+            FROM users
+            WHERE role='user' AND status='active' AND active=1 AND deleted_at IS NULL
+            ORDER BY LOWER(COALESCE(display_name, ''))
+        """)
+    lines = ["Администраторы"] + [f"• {clean_name(row['display_name'])} · {row['role']}" for row in admins]
+    buttons = [[InlineKeyboardButton(text=f"Добавить · {clean_name(row['display_name'])}"[:60], callback_data=f"admin_role_add:{row['user_id']}")] for row in candidates]
+    await callback.message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_role_add:"))
+async def admin_role_add_callback(callback: CallbackQuery) -> None:
+    target_id = int(callback.data.split(":", 1)[1])
+    ok, text = await set_user_role(target_id, "admin", callback.from_user.id)
+    await callback.message.answer(text)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_role_remove:"))
+async def admin_role_remove_callback(callback: CallbackQuery) -> None:
+    target_id = int(callback.data.split(":", 1)[1])
+    ok, text = await set_user_role(target_id, "user", callback.from_user.id)
+    await callback.message.answer(text)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_audit_menu")
+async def admin_audit_menu_callback(callback: CallbackQuery) -> None:
+    if not is_owner(callback.from_user.id):
+        await callback.answer("Только для владельца.", show_alert=True)
+        return
+    assert pool is not None
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT a.action, a.created_at,
+                   actor.display_name AS actor_name,
+                   target.display_name AS target_name
+            FROM admin_audit_log a
+            LEFT JOIN users actor ON actor.user_id=a.admin_user_id
+            LEFT JOIN users target ON target.user_id=a.target_user_id
+            ORDER BY a.created_at DESC
+            LIMIT 20
+        """)
+    if not rows:
+        await callback.message.answer("Журнал действий пока пуст.")
+    else:
+        lines = ["Последние действия администраторов"]
+        for row in rows:
+            when = row["created_at"].astimezone(TZ).strftime("%d.%m %H:%M")
+            actor = clean_name(row["actor_name"])
+            target = f" · {clean_name(row['target_name'])}" if row["target_name"] else ""
+            lines.append(f"• {when} · {actor} · {row['action']}{target}")
+        await callback.message.answer("\n".join(lines))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_bot_state")
+async def admin_bot_state_callback(callback: CallbackQuery) -> None:
+    if not is_owner(callback.from_user.id):
+        await callback.answer("Только для владельца.", show_alert=True)
+        return
+    assert pool is not None
+    async with pool.acquire() as conn:
+        jobs = await conn.fetch("""
+            SELECT job_name, cycle_key, status, started_at, completed_at, error_text
+            FROM scheduler_runs
+            ORDER BY started_at DESC
+            LIMIT 10
+        """)
+        unavailable = await conn.fetchval("SELECT COUNT(*) FROM users WHERE delivery_available=0")
+    lines = ["Состояние бота", f"Недоступны для доставки: {unavailable}"]
+    if not jobs:
+        lines.append("Запусков scheduler пока нет.")
+    else:
+        lines.append("Последние задачи:")
+        for row in jobs:
+            lines.append(f"• {row['job_name']} · {row['cycle_key']} · {row['status']}")
+    await callback.message.answer("\n".join(lines))
     await callback.answer()
 
 # =========================================================
