@@ -1,4 +1,4 @@
-print("RUNNING FILE: MAIN.PY STABLE POSTGRES + THANKS VERSION")
+print("RUNNING FILE: MAIN.PY V2 PROFILES + LEGACY MATCHING/THANKS")
 
 import asyncio
 import logging
@@ -92,6 +92,42 @@ def next_cycle(moment: datetime | None = None) -> str:
 def clean_name(value: str | None) -> str:
     value = (value or "").strip()
     return value if value else "Коллега"
+
+
+TEAM_LABELS = {
+    "sales": "Продажи",
+    "operations": "Операции",
+    "marketing": "Маркетинг",
+    "other": "",
+}
+
+
+def team_label(team: str | None) -> str:
+    return TEAM_LABELS.get(team or "", "")
+
+
+def profile_is_complete(user: asyncpg.Record | dict) -> bool:
+    return (
+        bool(clean_name(user["display_name"]))
+        and user["name_confirmed"] == 1
+        and user["team"] in TEAM_LABELS
+        and bool((user["responsibility_text"] or "").strip())
+        and user["onboarding_step"] == "completed"
+        and user["profile_migration_required"] == 0
+    )
+
+
+def profile_title(user: asyncpg.Record | dict) -> str:
+    name = clean_name(user["display_name"])
+    label = team_label(user["team"])
+    return f"{name} · {label}" if label else name
+
+
+def access_denied_message() -> str:
+    return (
+        "Сейчас не могу предоставить доступ к боту.\n\n"
+        "Попробуйте обратиться к коллегам из отдела PR и коммуникаций."
+    )
 
 
 def contact_name(user: asyncpg.Record | dict) -> str:
@@ -283,39 +319,111 @@ async def get_user(user_id: int):
         return await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
 
 
-async def register_user(user_id: int, username: str, first_name: str | None):
+async def register_user(user_id: int, username: str | None, first_name: str | None):
+    """
+    Создаёт нового пользователя в pending_activation или обновляет Telegram-данные
+    существующего пользователя. Старые активные пользователи не проходят повторную
+    активацию, но должны один раз дополнить профиль v2.
+    """
     assert pool is not None
     fallback_name = clean_name(first_name or username)
 
     async with pool.acquire() as conn:
         existing = await conn.fetchrow(
-            "SELECT removed_by_admin FROM users WHERE user_id=$1",
+            "SELECT * FROM users WHERE user_id=$1",
             user_id,
         )
 
-        if existing and existing["removed_by_admin"] == 1:
-            return None
+        if not existing:
+            await conn.execute("""
+                INSERT INTO users (
+                    user_id, username, first_name, display_name,
+                    name_confirmed, active, confirmed, confirmed_cycle,
+                    removed_by_admin, deleted_at, created_at, updated_at,
+                    team, responsibility_text, status, role,
+                    onboarding_step, profile_migration_required,
+                    last_interaction_at, delivery_available
+                )
+                VALUES (
+                    $1, $2, $3, $4,
+                    0, 0, 0, NULL,
+                    0, NULL, NOW(), NOW(),
+                    NULL, NULL, 'pending_activation', 'user',
+                    'name', 0,
+                    NOW(), 1
+                )
+            """, user_id, username, first_name, fallback_name)
+            return await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
+
+        # Старое админское удаление трактуем как закрытый доступ.
+        if existing["removed_by_admin"] == 1:
+            await conn.execute("""
+                UPDATE users
+                SET username=$2,
+                    first_name=$3,
+                    active=0,
+                    status='access_denied',
+                    deleted_at=NULL,
+                    access_denied_reason=COALESCE(access_denied_reason, 'admin_revoked'),
+                    access_denied_at=COALESCE(access_denied_at, NOW()),
+                    last_interaction_at=NOW(),
+                    delivery_available=1,
+                    updated_at=NOW()
+                WHERE user_id=$1
+            """, user_id, username, first_name)
+            return await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
+
+        if existing["status"] == "access_denied":
+            await conn.execute("""
+                UPDATE users
+                SET username=$2,
+                    first_name=$3,
+                    last_interaction_at=NOW(),
+                    delivery_available=1,
+                    updated_at=NOW()
+                WHERE user_id=$1
+            """, user_id, username, first_name)
+            return await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
+
+        # После самостоятельного удаления возвращение начинается как новая заявка:
+        # профиль заполняется заново и снова требует активации админом.
+        if existing["status"] == "self_deleted" or existing["deleted_at"] is not None:
+            await conn.execute("""
+                UPDATE users
+                SET username=$2,
+                    first_name=$3,
+                    display_name=$4,
+                    name_confirmed=0,
+                    team=NULL,
+                    responsibility_text=NULL,
+                    active=0,
+                    confirmed=0,
+                    confirmed_cycle=NULL,
+                    removed_by_admin=0,
+                    deleted_at=NULL,
+                    status='pending_activation',
+                    role='user',
+                    onboarding_step='name',
+                    profile_migration_required=0,
+                    activated_at=NULL,
+                    access_denied_at=NULL,
+                    access_denied_reason=NULL,
+                    last_interaction_at=NOW(),
+                    delivery_available=1,
+                    updated_at=NOW()
+                WHERE user_id=$1
+            """, user_id, username, first_name, fallback_name)
+            return await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
 
         await conn.execute("""
-            INSERT INTO users (
-                user_id, username, first_name, display_name,
-                name_confirmed, active, confirmed, confirmed_cycle,
-                removed_by_admin, deleted_at, created_at, updated_at
-            )
-            VALUES ($1, $2, $3, $4, 0, 1, 0, NULL, 0, NULL, NOW(), NOW())
-            ON CONFLICT (user_id)
-            DO UPDATE SET
-                username = EXCLUDED.username,
-                first_name = EXCLUDED.first_name,
-                display_name = CASE
-                    WHEN users.name_confirmed = 1 THEN users.display_name
-                    ELSE EXCLUDED.display_name
-                END,
-                active = 1,
-                deleted_at = NULL,
-                removed_by_admin = 0,
-                updated_at = NOW()
-        """, user_id, username, first_name, fallback_name)
+            UPDATE users
+            SET username=$2,
+                first_name=$3,
+                last_interaction_at=NOW(),
+                delivery_available=1,
+                updated_at=NOW()
+            WHERE user_id=$1
+        """, user_id, username, first_name)
 
         return await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
 
@@ -330,13 +438,111 @@ async def set_display_name(user_id: int, display_name: str) -> None:
         """, display_name, user_id)
 
 
+async def set_profile_team(user_id: int, team: str) -> None:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE users
+            SET team=$1, updated_at=NOW()
+            WHERE user_id=$2 AND deleted_at IS NULL
+        """, team, user_id)
+
+
+async def set_responsibility_text(user_id: int, responsibility_text: str) -> None:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE users
+            SET responsibility_text=$1, updated_at=NOW()
+            WHERE user_id=$2 AND deleted_at IS NULL
+        """, responsibility_text, user_id)
+
+
+async def set_onboarding_step(user_id: int, step: str) -> None:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE users
+            SET onboarding_step=$1, updated_at=NOW()
+            WHERE user_id=$2
+        """, step, user_id)
+
+
+async def complete_profile_setup(user_id: int) -> None:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE users
+            SET onboarding_step='completed',
+                profile_migration_required=0,
+                updated_at=NOW()
+            WHERE user_id=$1
+        """, user_id)
+
+
+async def activate_pending_user(user_id: int) -> bool:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        result = await conn.execute("""
+            UPDATE users
+            SET status='active',
+                active=1,
+                removed_by_admin=0,
+                activated_at=NOW(),
+                access_denied_at=NULL,
+                access_denied_reason=NULL,
+                updated_at=NOW()
+            WHERE user_id=$1
+              AND status='pending_activation'
+              AND onboarding_step='completed'
+              AND profile_migration_required=0
+        """, user_id)
+        return result.endswith("1")
+
+
+async def deny_pending_user(user_id: int) -> bool:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        result = await conn.execute("""
+            UPDATE users
+            SET status='access_denied',
+                active=0,
+                removed_by_admin=1,
+                confirmed_cycle=NULL,
+                access_denied_at=NOW(),
+                access_denied_reason='activation_rejected',
+                updated_at=NOW()
+            WHERE user_id=$1
+              AND status='pending_activation'
+        """, user_id)
+        return result.endswith("1")
+
+
+async def get_pending_activation_users():
+    assert pool is not None
+    async with pool.acquire() as conn:
+        return await conn.fetch("""
+            SELECT *
+            FROM users
+            WHERE status='pending_activation'
+              AND onboarding_step='completed'
+              AND profile_migration_required=0
+            ORDER BY created_at, user_id
+        """)
+
+
 async def pause_user(user_id: int) -> bool:
     assert pool is not None
     async with pool.acquire() as conn:
         result = await conn.execute("""
             UPDATE users
-            SET active=0, confirmed_cycle=NULL, updated_at=NOW()
-            WHERE user_id=$1 AND deleted_at IS NULL
+            SET active=0,
+                status='paused',
+                confirmed_cycle=NULL,
+                updated_at=NOW()
+            WHERE user_id=$1
+              AND deleted_at IS NULL
+              AND status='active'
         """, user_id)
         return result.endswith("1")
 
@@ -345,15 +551,23 @@ async def resume_user(user_id: int) -> str:
     user = await get_user(user_id)
     if not user:
         return "missing"
-    if user["removed_by_admin"] == 1:
+    if user["status"] == "access_denied" or user["removed_by_admin"] == 1:
         return "admin_removed"
-    if user["deleted_at"] is not None:
+    if user["status"] == "self_deleted" or user["deleted_at"] is not None:
         return "deleted"
+    if user["status"] == "pending_activation":
+        return "pending"
 
     assert pool is not None
     async with pool.acquire() as conn:
         await conn.execute("""
-            UPDATE users SET active=1, updated_at=NOW() WHERE user_id=$1
+            UPDATE users
+            SET active=1,
+                status='active',
+                last_interaction_at=NOW(),
+                delivery_available=1,
+                updated_at=NOW()
+            WHERE user_id=$1
         """, user_id)
     return "ok"
 
@@ -379,8 +593,14 @@ async def anonymize_self(user_id: int) -> None:
                     first_name=NULL,
                     display_name='Удалённый пользователь',
                     name_confirmed=0,
+                    team=NULL,
+                    responsibility_text=NULL,
                     active=0,
                     confirmed_cycle=NULL,
+                    status='self_deleted',
+                    role='user',
+                    onboarding_step='completed',
+                    profile_migration_required=0,
                     removed_by_admin=0,
                     deleted_at=NOW(),
                     updated_at=NOW()
@@ -400,8 +620,11 @@ async def remove_user_by_admin(user_id: int) -> bool:
                 UPDATE users
                 SET active=0,
                     confirmed_cycle=NULL,
+                    status='access_denied',
                     removed_by_admin=1,
-                    deleted_at=NOW(),
+                    deleted_at=NULL,
+                    access_denied_at=NOW(),
+                    access_denied_reason='admin_revoked',
                     updated_at=NOW()
                 WHERE user_id=$1
             """, user_id)
@@ -409,11 +632,14 @@ async def remove_user_by_admin(user_id: int) -> bool:
 
 
 async def deactivate_unreachable_user(user_id: int) -> None:
+    # Недоступность Telegram не равна паузе или закрытию доступа.
     assert pool is not None
     async with pool.acquire() as conn:
         await conn.execute("""
             UPDATE users
-            SET active=0, confirmed_cycle=NULL, updated_at=NOW()
+            SET delivery_available=0,
+                last_delivery_error_at=NOW(),
+                updated_at=NOW()
             WHERE user_id=$1
         """, user_id)
 
@@ -423,9 +649,13 @@ async def get_active_users():
     async with pool.acquire() as conn:
         return await conn.fetch("""
             SELECT user_id, username, first_name, display_name, name_confirmed,
-                   active, deleted_at, removed_by_admin
+                   active, deleted_at, removed_by_admin, status, team,
+                   responsibility_text, profile_migration_required, onboarding_step
             FROM users
-            WHERE active=1 AND deleted_at IS NULL AND removed_by_admin=0
+            WHERE active=1
+              AND status='active'
+              AND deleted_at IS NULL
+              AND removed_by_admin=0
             ORDER BY LOWER(COALESCE(display_name, first_name, username, ''))
         """)
 
@@ -435,9 +665,10 @@ async def get_visible_users_for_admin():
     async with pool.acquire() as conn:
         return await conn.fetch("""
             SELECT user_id, username, display_name, active, name_confirmed,
-                   deleted_at, removed_by_admin
+                   deleted_at, removed_by_admin, status, team,
+                   responsibility_text, profile_migration_required, onboarding_step
             FROM users
-            WHERE deleted_at IS NULL
+            WHERE status <> 'self_deleted'
             ORDER BY LOWER(COALESCE(display_name, username, ''))
         """)
 
@@ -448,7 +679,12 @@ async def set_confirmed_cycle(user_id: int, cycle_key: str | None) -> None:
         await conn.execute("""
             UPDATE users
             SET confirmed_cycle=$1, updated_at=NOW()
-            WHERE user_id=$2 AND active=1 AND deleted_at IS NULL
+            WHERE user_id=$2
+              AND active=1
+              AND status='active'
+              AND deleted_at IS NULL
+              AND profile_migration_required=0
+              AND onboarding_step='completed'
         """, cycle_key, user_id)
 
 
@@ -456,14 +692,19 @@ async def get_confirmed_users(cycle_key: str):
     assert pool is not None
     async with pool.acquire() as conn:
         return await conn.fetch("""
-            SELECT user_id, username, first_name, display_name
+            SELECT user_id, username, first_name, display_name,
+                   team, responsibility_text
             FROM users
             WHERE active=1
+              AND status='active'
               AND deleted_at IS NULL
               AND removed_by_admin=0
+              AND profile_migration_required=0
+              AND onboarding_step='completed'
               AND confirmed_cycle=$1
             ORDER BY user_id
         """, cycle_key)
+
 
 # =========================================================
 # СОСТОЯНИЯ ДИАЛОГА В POSTGRES
@@ -598,8 +839,17 @@ async def get_pending_broadcast_users(job_name: str, cycle_key: str):
             SELECT u.user_id, u.username, u.first_name, u.display_name
             FROM users u
             WHERE u.active=1
+              AND u.status='active'
               AND u.deleted_at IS NULL
               AND u.removed_by_admin=0
+              AND u.delivery_available=1
+              AND (
+                  $1 NOT LIKE 'random_checkin%'
+                  OR (
+                      u.profile_migration_required=0
+                      AND u.onboarding_step='completed'
+                  )
+              )
               AND NOT EXISTS (
                   SELECT 1
                   FROM broadcast_deliveries d
@@ -698,6 +948,57 @@ def name_start_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def profile_migration_start_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Обновить профиль", callback_data="profile_migration_start")]
+        ]
+    )
+
+
+def profile_name_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Оставить это имя", callback_data="profile_keep_name")],
+            [InlineKeyboardButton(text="Изменить имя", callback_data="profile_change_name")],
+        ]
+    )
+
+
+def profile_team_keyboard(mode: str = "onboarding") -> InlineKeyboardMarkup:
+    prefix = "profile_team_edit" if mode == "edit" else "profile_team"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Продажи", callback_data=f"{prefix}:sales")],
+            [InlineKeyboardButton(text="Операции", callback_data=f"{prefix}:operations")],
+            [InlineKeyboardButton(text="Маркетинг", callback_data=f"{prefix}:marketing")],
+            [InlineKeyboardButton(
+                text="Не отношусь ни к одной из этих команд",
+                callback_data=f"{prefix}:other",
+            )],
+        ]
+    )
+
+
+def profile_actions_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Изменить имя", callback_data="profile_edit_name")],
+            [InlineKeyboardButton(text="Изменить команду", callback_data="profile_edit_team")],
+            [InlineKeyboardButton(text="Изменить описание", callback_data="profile_edit_responsibility")],
+        ]
+    )
+
+
+def pending_activation_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Активировать", callback_data=f"admin_activate:{user_id}")],
+            [InlineKeyboardButton(text="Не активировать", callback_data=f"admin_deny_activation:{user_id}")],
+        ]
+    )
+
+
 def delete_me_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -727,58 +1028,455 @@ def thanks_confirm_keyboard() -> InlineKeyboardMarkup:
     )
 
 # =========================================================
-# РЕГИСТРАЦИЯ И ИМЕНА
+# ПРОФИЛИ И ОНБОРДИНГ V2
 # =========================================================
-@router.message(Command("start"))
-async def start(message: Message) -> None:
-    if not message.from_user.username:
+async def send_profile_step(message: Message, user: asyncpg.Record) -> None:
+    step = user["onboarding_step"]
+
+    if step == "name":
+        if user["status"] == "pending_activation":
+            await message.answer(
+                "Привет. Это Random Ristretto.\n\n"
+                "Это как Random Coffee, только короче и концентрированнее: "
+                "раз в неделю я знакомлю тебя с кем-то из коллег для короткого разговора.\n\n"
+                "Ещё здесь можно отправлять благодарности коллегам — лично или включать их "
+                "в пятничный дайджест.\n\n"
+                "Для начала давай познакомимся.\n\n"
+                "Шаг 1 из 3:\n"
+                "Как тебя зовут? Напиши имя и фамилию."
+            )
+        else:
+            await message.answer(
+                "Шаг 1 из 3:\n"
+                "Как тебя зовут? Напиши имя и фамилию."
+            )
+        return
+
+    if step == "name_confirm":
         await message.answer(
-            "Для работы бота нужен username в Telegram.\n\n"
-            "Откройте Telegram → Настройки → Имя пользователя, создайте username, "
-            "а затем снова отправьте /start."
+            f"Шаг 1 из 3:\n"
+            f"Сейчас твоё имя в боте: {clean_name(user['display_name'])}\n\n"
+            "Оставляем его или меняем?",
+            reply_markup=profile_name_confirm_keyboard(),
         )
         return
 
+    if step == "team":
+        await message.answer(
+            "Шаг 2 из 3:\n"
+            "В какой ты команде?",
+            reply_markup=profile_team_keyboard(),
+        )
+        return
+
+    if step == "responsibility":
+        await message.answer(
+            "Шаг 3 из 3:\n"
+            "Напиши коротко, за что ты отвечаешь.\n\n"
+            "Это поможет человеку перед Ristretto примерно понять, чем ты занимаешься.\n\n"
+            "Здесь поместятся два коротких предложения, «Война и мир» — нет 🤍"
+        )
+        return
+
+    if step == "completed" and user["status"] == "pending_activation":
+        await message.answer(
+            "Профиль готов.\n"
+            "Скоро админ активирует твой профиль — и ты в Ristretto."
+        )
+
+
+async def show_profile(message: Message, user: asyncpg.Record) -> None:
+    username = f"@{user['username']}" if user["username"] else "Telegram username не указан"
+    responsibility = (user["responsibility_text"] or "").strip() or "не заполнено"
+
+    await message.answer(
+        "Твой профиль\n\n"
+        f"{profile_title(user)}\n"
+        f"Отвечает за: {responsibility}\n"
+        f"{username}",
+        reply_markup=profile_actions_keyboard(),
+    )
+
+
+async def notify_owner_pending_activation(user_id: int) -> None:
+    user = await get_user(user_id)
+    if not user:
+        return
+
+    username = f"@{user['username']}" if user["username"] else "username отсутствует"
+    team = team_label(user["team"]) or "Другая команда"
+
+    text = (
+        "Новый профиль ждёт активации\n\n"
+        f"{clean_name(user['display_name'])}\n"
+        f"Команда: {team}\n"
+        f"Отвечает за: {(user['responsibility_text'] or '').strip()}\n"
+        f"Telegram: {username}"
+    )
+
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            text,
+            reply_markup=pending_activation_keyboard(user_id),
+        )
+    except Exception:
+        logging.exception("Не удалось отправить админу новый профиль на активацию")
+
+
+async def maybe_offer_current_week_after_profile_update(user_id: int) -> None:
+    user = await get_user(user_id)
+    if not user or user["status"] != "active" or user["active"] != 1:
+        return
+
+    now = datetime.now(TZ)
+    before_tuesday_0001 = (
+        now.weekday() == 0
+        or (now.weekday() == 1 and now.hour == 0 and now.minute == 0)
+    )
+    if not before_tuesday_0001:
+        return
+
+    cycle_key = current_cycle(now)
+    if user["confirmed_cycle"] == cycle_key:
+        return
+
+    match_status = await get_job_status("random_match", cycle_key)
+    if match_status is not None:
+        return
+
+    await mark_broadcast_delivered("random_checkin", cycle_key, user_id)
+    await bot.send_message(
+        user_id,
+        "Готов(а) к Random Ristretto на этой неделе?",
+        reply_markup=checkin_keyboard(cycle_key),
+    )
+
+
+async def finish_profile_after_responsibility(message: Message, user_id: int, text: str) -> None:
+    user_before = await get_user(user_id)
+    if not user_before:
+        return
+
+    was_migration = user_before["profile_migration_required"] == 1
+
+    await set_responsibility_text(user_id, text)
+    await complete_profile_setup(user_id)
+    user = await get_user(user_id)
+
+    if not user:
+        return
+
+    if user["status"] == "pending_activation":
+        await message.answer(
+            "Профиль готов.\n"
+            "Скоро админ активирует твой профиль — и ты в Ristretto."
+        )
+        await notify_owner_pending_activation(user_id)
+        return
+
+    if was_migration:
+        await message.answer("Профиль обновлён.")
+        await maybe_offer_current_week_after_profile_update(user_id)
+        return
+
+    await show_profile(message, user)
+
+
+@router.message(Command("start"))
+async def start(message: Message) -> None:
     user = await register_user(
         message.from_user.id,
         message.from_user.username,
         message.from_user.first_name,
     )
 
-    if user is None:
-        await message.answer("Ваш профиль отключён администратором.")
+    if user["status"] == "access_denied":
+        await message.answer(access_denied_message())
+        return
+
+    if user["status"] == "pending_activation":
+        await send_profile_step(message, user)
+        return
+
+    if user["profile_migration_required"] == 1:
+        if user["onboarding_step"] == "completed":
+            await message.answer(
+                "Random Ristretto немного подрос.\n\n"
+                "Нас становится больше, поэтому теперь перед встречей я буду показывать "
+                "не только имя коллеги, но и команду и пару слов о том, чем человек занимается.\n\n"
+                "Нужно один раз дополнить профиль. Всего три коротких шага.",
+                reply_markup=profile_migration_start_keyboard(),
+            )
+        else:
+            await send_profile_step(message, user)
         return
 
     await message.answer(
-        "☕️ Random Ristretto\n"
-        "Короткие разговоры. Сильный кофе.\n\n"
-        "Раз в неделю я буду спрашивать, хотите ли вы участвовать в Random Ristretto."
+        "Random Ristretto готов.\n\n"
+        "Команды:\n"
+        "/thanks — поблагодарить коллегу\n"
+        "/profile — мой профиль\n"
+        "/leave — поставить бот на паузу\n"
+        "/resume — вернуться"
     )
 
-    if user["name_confirmed"] != 1:
-        await set_flow(message.from_user.id, "set_name", "waiting_name")
-        await message.answer(
-            "Напишите одним сообщением имя, которое будут видеть коллеги.\n\n"
-            "Например: Анна Петрова"
+
+@router.callback_query(F.data == "profile_migration_start")
+async def profile_migration_start_callback(callback: CallbackQuery) -> None:
+    user = await get_user(callback.from_user.id)
+    if not user or user["profile_migration_required"] != 1:
+        await callback.answer("Профиль уже обновлён.", show_alert=True)
+        return
+
+    await set_onboarding_step(callback.from_user.id, "name_confirm")
+    user = await get_user(callback.from_user.id)
+    await send_profile_step(callback.message, user)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "profile_keep_name")
+async def profile_keep_name_callback(callback: CallbackQuery) -> None:
+    user = await get_user(callback.from_user.id)
+    if (
+        not user
+        or user["profile_migration_required"] != 1
+        or user["onboarding_step"] != "name_confirm"
+    ):
+        await callback.answer("Этот шаг уже завершён.", show_alert=True)
+        return
+
+    await set_display_name(callback.from_user.id, clean_name(user["display_name"]))
+    await set_onboarding_step(callback.from_user.id, "team")
+    user = await get_user(callback.from_user.id)
+    await send_profile_step(callback.message, user)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "profile_change_name")
+async def profile_change_name_callback(callback: CallbackQuery) -> None:
+    user = await get_user(callback.from_user.id)
+    if not user or user["profile_migration_required"] != 1:
+        await callback.answer("Профиль уже обновлён.", show_alert=True)
+        return
+
+    await set_onboarding_step(callback.from_user.id, "name")
+    user = await get_user(callback.from_user.id)
+    await send_profile_step(callback.message, user)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("profile_team:"))
+async def profile_team_callback(callback: CallbackQuery) -> None:
+    team = callback.data.split(":", 1)[1]
+    if team not in TEAM_LABELS:
+        await callback.answer("Неизвестная команда.", show_alert=True)
+        return
+
+    user = await get_user(callback.from_user.id)
+    if (
+        not user
+        or user["onboarding_step"] != "team"
+        or (
+            user["status"] != "pending_activation"
+            and user["profile_migration_required"] != 1
         )
+    ):
+        await callback.answer("Этот шаг уже завершён.", show_alert=True)
+        return
+
+    await set_profile_team(callback.from_user.id, team)
+    await set_onboarding_step(callback.from_user.id, "responsibility")
+    user = await get_user(callback.from_user.id)
+    await send_profile_step(callback.message, user)
+    await callback.answer()
+
+
+@router.message(Command("profile"))
+async def profile_command(message: Message) -> None:
+    user = await get_user(message.from_user.id)
+    if not user:
+        await message.answer("Сначала отправь /start.")
+        return
+
+    if user["status"] == "access_denied":
+        await message.answer(access_denied_message())
+        return
+
+    if user["status"] == "self_deleted":
+        await message.answer("Профиль удалён. Чтобы вернуться, отправь /start.")
+        return
+
+    if user["status"] == "pending_activation" and user["onboarding_step"] != "completed":
+        await send_profile_step(message, user)
+        return
+
+    if user["profile_migration_required"] == 1:
+        await message.answer(
+            "Сначала нужно один раз дополнить профиль.",
+            reply_markup=profile_migration_start_keyboard(),
+        )
+        return
+
+    await show_profile(message, user)
 
 
 @router.message(Command("name"))
 async def name_command(message: Message) -> None:
     user = await get_user(message.from_user.id)
-    if not user or user["deleted_at"] is not None:
-        await message.answer("Сначала зарегистрируйтесь командой /start.")
+    if not user or user["status"] in {"self_deleted", "access_denied"}:
+        await message.answer("Сначала отправь /start.")
         return
 
-    await set_flow(message.from_user.id, "set_name", "waiting_name")
-    await message.answer("Напишите новое имя одним сообщением.")
+    await set_flow(message.from_user.id, "profile_edit", "waiting_name")
+    await message.answer("Напиши новое имя и фамилию одним сообщением.")
 
 
-@router.callback_query(F.data == "name_start")
-async def name_start_callback(callback: CallbackQuery) -> None:
-    await set_flow(callback.from_user.id, "set_name", "waiting_name")
-    await callback.message.answer("Напишите имя одним сообщением. Например: Анна Петрова")
+@router.callback_query(F.data == "profile_edit_name")
+async def profile_edit_name_callback(callback: CallbackQuery) -> None:
+    user = await get_user(callback.from_user.id)
+    if not user or user["status"] in {"self_deleted", "access_denied"}:
+        await callback.answer("Профиль недоступен.", show_alert=True)
+        return
+
+    await set_flow(callback.from_user.id, "profile_edit", "waiting_name")
+    await callback.message.answer("Напиши новое имя и фамилию одним сообщением.")
     await callback.answer()
+
+
+@router.callback_query(F.data == "profile_edit_team")
+async def profile_edit_team_callback(callback: CallbackQuery) -> None:
+    user = await get_user(callback.from_user.id)
+    if not user or user["status"] in {"self_deleted", "access_denied"}:
+        await callback.answer("Профиль недоступен.", show_alert=True)
+        return
+
+    await callback.message.answer(
+        "Выбери команду:",
+        reply_markup=profile_team_keyboard(mode="edit"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("profile_team_edit:"))
+async def profile_team_edit_value_callback(callback: CallbackQuery) -> None:
+    team = callback.data.split(":", 1)[1]
+    if team not in TEAM_LABELS:
+        await callback.answer("Неизвестная команда.", show_alert=True)
+        return
+
+    user = await get_user(callback.from_user.id)
+    if not user or user["status"] in {"self_deleted", "access_denied"}:
+        await callback.answer("Профиль недоступен.", show_alert=True)
+        return
+
+    await set_profile_team(callback.from_user.id, team)
+    user = await get_user(callback.from_user.id)
+    await callback.message.answer("Команда обновлена.")
+    await show_profile(callback.message, user)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "profile_edit_responsibility")
+async def profile_edit_responsibility_callback(callback: CallbackQuery) -> None:
+    user = await get_user(callback.from_user.id)
+    if not user or user["status"] in {"self_deleted", "access_denied"}:
+        await callback.answer("Профиль недоступен.", show_alert=True)
+        return
+
+    await set_flow(callback.from_user.id, "profile_edit", "waiting_responsibility")
+    await callback.message.answer(
+        "Напиши коротко, за что ты отвечаешь. Максимум 150 знаков."
+    )
+    await callback.answer()
+
+
+@router.message(Command("pending"))
+async def pending_activation_command(message: Message) -> None:
+    if not await require_admin(message):
+        return
+
+    users = await get_pending_activation_users()
+    if not users:
+        await message.answer("Сейчас никто не ждёт активации.")
+        return
+
+    for user in users:
+        username = f"@{user['username']}" if user["username"] else "username отсутствует"
+        team = team_label(user["team"]) or "Другая команда"
+        await message.answer(
+            "Профиль ждёт активации\n\n"
+            f"{clean_name(user['display_name'])}\n"
+            f"Команда: {team}\n"
+            f"Отвечает за: {(user['responsibility_text'] or '').strip()}\n"
+            f"Telegram: {username}",
+            reply_markup=pending_activation_keyboard(user["user_id"]),
+        )
+
+
+@router.callback_query(F.data.startswith("admin_activate:"))
+async def admin_activate_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    user_id = int(callback.data.split(":", 1)[1])
+    user = await get_user(user_id)
+    if not user:
+        await callback.answer("Профиль не найден.", show_alert=True)
+        return
+
+    activated = await activate_pending_user(user_id)
+    if not activated:
+        await callback.answer("Профиль уже обработан.", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        f"Доступ открыт: {clean_name(user['display_name'])}"
+    )
+
+    try:
+        await bot.send_message(
+            user_id,
+            "Готово, доступ открыт.\n\n"
+            "По понедельникам я буду спрашивать, готов(а) ли ты к Ristretto на этой неделе.\n"
+            "По средам — напоминать, что можно отправить кому-нибудь спасибо.\n\n"
+            "Команды: /thanks, /profile, /leave"
+        )
+    except Exception:
+        logging.exception("Не удалось сообщить пользователю об активации")
+
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_deny_activation:"))
+async def admin_deny_activation_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    user_id = int(callback.data.split(":", 1)[1])
+    user = await get_user(user_id)
+    if not user:
+        await callback.answer("Профиль не найден.", show_alert=True)
+        return
+
+    denied = await deny_pending_user(user_id)
+    if not denied:
+        await callback.answer("Профиль уже обработан.", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        f"Доступ не открыт: {clean_name(user['display_name'])}"
+    )
+
+    try:
+        await bot.send_message(user_id, access_denied_message())
+    except Exception:
+        logging.exception("Не удалось сообщить пользователю об отказе в доступе")
+
+    await callback.answer()
+
 
 # =========================================================
 # ПАУЗА, ВОЗВРАТ И УДАЛЕНИЕ СВОИХ ДАННЫХ
@@ -788,11 +1486,18 @@ async def leave(message: Message) -> None:
     changed = await pause_user(message.from_user.id)
     if changed:
         await message.answer(
-            "Участие приостановлено. Вы не будете получать новые рассылки.\n\n"
-            "Чтобы вернуться, отправьте /resume."
+            "Бот на паузе. Автоматические сообщения приходить не будут.\n\n"
+            "При этом можно вручную пользоваться /thanks, /profile и другими командами.\n"
+            "Чтобы вернуться к рассылкам, отправь /resume."
         )
     else:
-        await message.answer("Профиль не найден. Отправьте /start.")
+        user = await get_user(message.from_user.id)
+        if user and user["status"] == "paused":
+            await message.answer("Бот уже на паузе. Чтобы вернуться, отправь /resume.")
+        elif user and user["status"] == "access_denied":
+            await message.answer(access_denied_message())
+        else:
+            await message.answer("Профиль не найден или пока не активирован. Отправь /start.")
 
 
 @router.message(Command("resume"))
@@ -800,26 +1505,33 @@ async def resume(message: Message) -> None:
     result = await resume_user(message.from_user.id)
 
     if result == "ok":
-        await message.answer("Участие возобновлено.")
+        await message.answer("Готово, автоматические сообщения снова включены.")
     elif result == "admin_removed":
-        await message.answer("Ваш профиль отключён администратором.")
+        await message.answer(access_denied_message())
     elif result == "deleted":
-        await message.answer("Профиль удалён. Для новой регистрации отправьте /start.")
+        await message.answer("Профиль удалён. Чтобы вернуться, отправь /start.")
+    elif result == "pending":
+        await message.answer("Профиль пока ждёт активации администратора.")
     else:
-        await message.answer("Профиль не найден. Отправьте /start.")
+        await message.answer("Профиль не найден. Отправь /start.")
 
 
 @router.message(Command("delete_me"))
 async def delete_me(message: Message) -> None:
     user = await get_user(message.from_user.id)
-    if not user or user["deleted_at"] is not None:
+    if (
+        not user
+        or user["status"] in {"self_deleted", "access_denied"}
+        or user["deleted_at"] is not None
+    ):
         await message.answer("Активный профиль не найден.")
         return
 
     await message.answer(
-        "Удалить ваши личные данные из бота?\n\n"
-        "Вы перестанете получать рассылки и участвовать в мэтчинге. "
-        "История общих результатов останется обезличенной.",
+        "Удалить профиль из бота?\n\n"
+        "Ты перестанешь получать рассылки и участвовать в мэтчинге. "
+        "Если захочешь вернуться позже, профиль нужно будет заполнить заново "
+        "и снова активировать у администратора.",
         reply_markup=delete_me_keyboard(),
     )
 
@@ -827,7 +1539,9 @@ async def delete_me(message: Message) -> None:
 @router.callback_query(F.data == "delete_me_confirm")
 async def delete_me_confirm(callback: CallbackQuery) -> None:
     await anonymize_self(callback.from_user.id)
-    await callback.message.edit_text("Ваши личные данные удалены из бота.")
+    await callback.message.edit_text(
+        "Профиль удалён. Если захочешь вернуться, просто отправь /start."
+    )
     await callback.answer()
 
 
@@ -836,6 +1550,7 @@ async def delete_me_cancel(callback: CallbackQuery) -> None:
     await callback.message.edit_text("Удаление отменено.")
     await callback.answer()
 
+
 # =========================================================
 # RANDOM RISTRETTO: CHECK-IN
 # =========================================================
@@ -843,7 +1558,7 @@ async def send_weekly_checkin(cycle_key: str, delivery_job: str = "random_checki
     await send_broadcast(
         delivery_job,
         cycle_key,
-        "☕️ Готов(а) к Random Ristretto на этой неделе?",
+        "Готов(а) к Random Ristretto на этой неделе?",
         reply_markup=checkin_keyboard(cycle_key),
     )
 
@@ -856,6 +1571,25 @@ async def checkin_yes(callback: CallbackQuery) -> None:
         await callback.answer("Это сообщение относится к другой неделе.", show_alert=True)
         return
 
+    user = await get_user(callback.from_user.id)
+    if (
+        not user
+        or user["status"] != "active"
+        or user["active"] != 1
+        or user["profile_migration_required"] != 0
+        or user["onboarding_step"] != "completed"
+    ):
+        await callback.answer(
+            "Сначала нужно завершить профиль.",
+            show_alert=True,
+        )
+        if user and user["profile_migration_required"] == 1:
+            await callback.message.answer(
+                "Чтобы участвовать в Ristretto, сначала дополни профиль.",
+                reply_markup=profile_migration_start_keyboard(),
+            )
+        return
+
     match_status = await get_job_status("random_match", cycle_key)
     if match_status is not None:
         await callback.answer("Запись на эту неделю уже закрыта.", show_alert=True)
@@ -863,7 +1597,7 @@ async def checkin_yes(callback: CallbackQuery) -> None:
 
     await set_confirmed_cycle(callback.from_user.id, cycle_key)
     await callback.message.edit_text(
-        "☕️ Отлично. Учту вас в Random Ristretto на этой неделе."
+        "Есть. Во вторник пришлю твою компанию на эту неделю."
     )
     await callback.answer()
 
@@ -877,16 +1611,17 @@ async def checkin_no(callback: CallbackQuery) -> None:
         return
 
     await set_confirmed_cycle(callback.from_user.id, None)
-    await callback.message.edit_text("☕️ Хорошо, пропустим эту неделю.")
+    await callback.message.edit_text("Хорошо, пропустим эту неделю.")
     await callback.answer()
 
 
 @router.callback_query(F.data.in_({"yes", "no"}))
 async def old_checkin_callback(callback: CallbackQuery) -> None:
     await callback.answer(
-        "Эта кнопка устарела. Дождитесь нового еженедельного сообщения.",
+        "Эта кнопка устарела. Дождись нового еженедельного сообщения.",
         show_alert=True,
     )
+
 
 # =========================================================
 # RANDOM RISTRETTO: МЭТЧИНГ
@@ -1086,8 +1821,24 @@ async def recipients_keyboard(sender_id: int) -> InlineKeyboardMarkup | None:
 
 async def begin_thanks(message: Message, sender_id: int) -> None:
     user = await get_user(sender_id)
-    if not user or user["active"] != 1 or user["deleted_at"] is not None:
-        await message.answer("Сначала зарегистрируйтесь или возобновите участие командой /resume.")
+    if not user:
+        await message.answer("Сначала отправь /start.")
+        return
+
+    if user["status"] == "access_denied":
+        await message.answer(access_denied_message())
+        return
+
+    if user["status"] == "pending_activation":
+        await message.answer("Сначала дождись активации профиля администратором.")
+        return
+
+    if user["status"] == "self_deleted" or user["deleted_at"] is not None:
+        await message.answer("Профиль удалён. Чтобы вернуться, отправь /start.")
+        return
+
+    if user["status"] not in {"active", "paused"}:
+        await message.answer("Сейчас благодарности недоступны.")
         return
 
     keyboard = await recipients_keyboard(sender_id)
@@ -1603,29 +2354,71 @@ async def match_now_command(message: Message) -> None:
         await message.answer("Во время мэтчинга произошла ошибка. Проверьте Railway Logs.")
 
 
-@router.message(Command("request_names_now"))
-async def request_names_now_command(message: Message) -> None:
-    if not await require_admin(message):
-        return
+async def send_profile_migration_requests() -> int:
+    assert pool is not None
+    job_name = "profile_migration_v2"
+    cycle_key = "v2"
+    async with pool.acquire() as conn:
+        users = await conn.fetch("""
+            SELECT u.user_id
+            FROM users u
+            WHERE u.status='active'
+              AND u.active=1
+              AND u.deleted_at IS NULL
+              AND u.removed_by_admin=0
+              AND u.delivery_available=1
+              AND u.profile_migration_required=1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM broadcast_deliveries d
+                  WHERE d.job_name=$1
+                    AND d.cycle_key=$2
+                    AND d.user_id=u.user_id
+              )
+            ORDER BY u.user_id
+        """, job_name, cycle_key)
 
-    users = [u for u in await get_active_users() if u["name_confirmed"] != 1]
     sent = 0
-
     for user in users:
         try:
             await bot.send_message(
                 user["user_id"],
-                "Для списка коллег нужно уточнить ваше имя. Нажмите кнопку и напишите, "
-                "как вас показывать другим участникам.",
-                reply_markup=name_start_keyboard(),
+                "Random Ristretto немного подрос.\n\n"
+                "Нас становится больше, поэтому теперь перед встречей я буду показывать "
+                "не только имя коллеги, но и команду и пару слов о том, чем человек занимается.\n\n"
+                "Нужно один раз дополнить профиль. Всего три коротких шага.",
+                reply_markup=profile_migration_start_keyboard(),
             )
+            await mark_broadcast_delivered(job_name, cycle_key, user["user_id"])
             sent += 1
         except TelegramForbiddenError:
             await deactivate_unreachable_user(user["user_id"])
         except Exception:
-            logging.exception("Не удалось запросить имя у пользователя %s", user["user_id"])
+            logging.exception(
+                "Не удалось отправить запрос профиля пользователю %s",
+                user["user_id"],
+            )
 
-    await message.answer(f"Запрос имени отправлен: {sent} пользователям.")
+    return sent
+
+
+@router.message(Command("request_profiles_now"))
+async def request_profiles_now_command(message: Message) -> None:
+    if not await require_admin(message):
+        return
+
+    sent = await send_profile_migration_requests()
+    await message.answer(f"Запрос обновить профиль отправлен: {sent} пользователям.")
+
+
+@router.message(Command("request_names_now"))
+async def request_names_now_command(message: Message) -> None:
+    # Старое имя команды оставляем как безопасный алиас на время перехода.
+    if not await require_admin(message):
+        return
+
+    sent = await send_profile_migration_requests()
+    await message.answer(f"Запрос обновить профиль отправлен: {sent} пользователям.")
 
 
 @router.message(Command("thanks_reminder_now"))
@@ -1681,27 +2474,113 @@ async def thanks_digest_now_command(message: Message) -> None:
 @router.message()
 async def flow_message_handler(message: Message) -> None:
     if not message.text:
-        await message.answer("Пожалуйста, отправьте текстовое сообщение.")
+        await message.answer("Пожалуйста, отправь текстовое сообщение.")
         return
+
+    text = message.text.strip()
+    user = await get_user(message.from_user.id)
+
+    # Новый онбординг и одноразовая миграция профиля хранят текущий шаг в users,
+    # поэтому переживают рестарт бота без потери прогресса.
+    if user and (
+        user["status"] == "pending_activation"
+        or user["profile_migration_required"] == 1
+    ):
+        step = user["onboarding_step"]
+
+        if step == "name":
+            if len(text) < 2 or len(text) > 80 or "\n" in text:
+                await message.answer(
+                    "Имя должно содержать от 2 до 80 символов. Попробуй ещё раз."
+                )
+                return
+
+            await set_display_name(message.from_user.id, text)
+            await set_onboarding_step(message.from_user.id, "team")
+            user = await get_user(message.from_user.id)
+            await send_profile_step(message, user)
+            return
+
+        if step == "responsibility":
+            if len(text) < 3:
+                await message.answer(
+                    "Напиши хотя бы несколько слов о том, за что ты отвечаешь."
+                )
+                return
+            if len(text) > 150:
+                await message.answer(
+                    f"Получилось {len(text)} знаков. Здесь максимум 150 — сократи немного."
+                )
+                return
+
+            await finish_profile_after_responsibility(
+                message,
+                message.from_user.id,
+                text,
+            )
+            return
+
+        if step in {"name_confirm", "team"}:
+            await send_profile_step(message, user)
+            return
 
     flow = await get_flow(message.from_user.id)
 
     if not flow:
+        if user and user["status"] == "access_denied":
+            await message.answer(access_denied_message())
+            return
+
         await message.answer(
             "Доступные команды:\n"
-            "/thanks — отправить благодарность\n"
-            "/name — изменить имя\n"
-            "/leave — приостановить участие\n"
+            "/thanks — поблагодарить коллегу\n"
+            "/profile — мой профиль\n"
+            "/leave — поставить бот на паузу\n"
             "/resume — вернуться\n"
-            "/delete_me — удалить личные данные"
+            "/delete_me — удалить профиль"
         )
         return
 
-    text = message.text.strip()
+    if flow["flow_type"] == "profile_edit" and flow["step"] == "waiting_name":
+        if len(text) < 2 or len(text) > 80 or "\n" in text:
+            await message.answer(
+                "Имя должно содержать от 2 до 80 символов. Попробуй ещё раз."
+            )
+            return
+
+        await set_display_name(message.from_user.id, text)
+        await clear_flow(message.from_user.id)
+        user = await get_user(message.from_user.id)
+        await message.answer("Имя обновлено.")
+        await show_profile(message, user)
+        return
+
+    if (
+        flow["flow_type"] == "profile_edit"
+        and flow["step"] == "waiting_responsibility"
+    ):
+        if len(text) < 3:
+            await message.answer("Напиши хотя бы несколько слов.")
+            return
+        if len(text) > 150:
+            await message.answer(
+                f"Получилось {len(text)} знаков. Здесь максимум 150 — сократи немного."
+            )
+            return
+
+        await set_responsibility_text(message.from_user.id, text)
+        await clear_flow(message.from_user.id)
+        user = await get_user(message.from_user.id)
+        await message.answer("Описание обновлено.")
+        await show_profile(message, user)
+        return
 
     if flow["flow_type"] == "set_name" and flow["step"] == "waiting_name":
+        # Совместимость со старым незавершённым диалогом изменения имени.
         if len(text) < 2 or len(text) > 80 or "\n" in text:
-            await message.answer("Имя должно содержать от 2 до 80 символов. Попробуйте ещё раз.")
+            await message.answer(
+                "Имя должно содержать от 2 до 80 символов. Попробуй ещё раз."
+            )
             return
 
         await set_display_name(message.from_user.id, text)
@@ -1711,7 +2590,7 @@ async def flow_message_handler(message: Message) -> None:
 
     if flow["flow_type"] == "thanks" and flow["step"] == "waiting_text":
         if len(text) < 3:
-            await message.answer("Текст слишком короткий. Напишите хотя бы несколько слов.")
+            await message.answer("Текст слишком короткий. Напиши хотя бы несколько слов.")
             return
         if len(text) > 1000:
             await message.answer("Текст должен быть не длиннее 1000 символов.")
@@ -1732,7 +2611,7 @@ async def flow_message_handler(message: Message) -> None:
         return
 
     await clear_flow(message.from_user.id)
-    await message.answer("Предыдущий диалог сброшен. Начните снова нужной командой.")
+    await message.answer("Предыдущий диалог сброшен. Начни снова нужной командой.")
 
 
 # =========================================================
