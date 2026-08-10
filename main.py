@@ -1,4 +1,4 @@
-print("RUNNING FILE: MAIN.PY V2 PROFILES + LEGACY MATCHING/THANKS")
+print("RUNNING FILE: MAIN.PY V2 PROFILES + MATCHING + LEGACY THANKS")
 
 import asyncio
 import logging
@@ -6,6 +6,7 @@ import os
 import random
 from contextlib import suppress
 from datetime import datetime, timedelta
+from itertools import combinations
 from zoneinfo import ZoneInfo
 
 import asyncpg
@@ -311,6 +312,7 @@ async def init_db() -> None:
         # Random Ristretto v2: additive foundation only.
         # This does not switch the current user-facing UX to v2 yet.
         await ensure_v2_foundation(conn, ADMIN_ID)
+        await backfill_match_relationships(conn)
 
 
 async def get_user(user_id: int):
@@ -673,36 +675,104 @@ async def get_visible_users_for_admin():
         """)
 
 
-async def set_confirmed_cycle(user_id: int, cycle_key: str | None) -> None:
+async def record_weekly_invite(user_id: int, cycle_key: str) -> None:
     assert pool is not None
     async with pool.acquire() as conn:
         await conn.execute("""
-            UPDATE users
-            SET confirmed_cycle=$1, updated_at=NOW()
-            WHERE user_id=$2
-              AND active=1
-              AND status='active'
-              AND deleted_at IS NULL
-              AND profile_migration_required=0
-              AND onboarding_step='completed'
-        """, cycle_key, user_id)
+            INSERT INTO weekly_participation (
+                user_id, cycle_key, invited_at, response, responded_at
+            )
+            VALUES ($1, $2, NOW(), NULL, NULL)
+            ON CONFLICT (user_id, cycle_key)
+            DO UPDATE SET invited_at=COALESCE(weekly_participation.invited_at, EXCLUDED.invited_at)
+        """, user_id, cycle_key)
+
+
+async def get_weekly_response(user_id: int, cycle_key: str) -> str | None:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        return await conn.fetchval("""
+            SELECT response
+            FROM weekly_participation
+            WHERE user_id=$1 AND cycle_key=$2
+        """, user_id, cycle_key)
+
+
+async def set_weekly_response(user_id: int, cycle_key: str, response: str) -> bool:
+    if response not in {"yes", "no"}:
+        raise ValueError("Unknown weekly participation response")
+
+    assert pool is not None
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            eligible = await conn.fetchval("""
+                SELECT 1
+                FROM users
+                WHERE user_id=$1
+                  AND active=1
+                  AND status='active'
+                  AND deleted_at IS NULL
+                  AND removed_by_admin=0
+                  AND profile_migration_required=0
+                  AND onboarding_step='completed'
+            """, user_id)
+            if not eligible:
+                return False
+
+            await conn.execute("""
+                INSERT INTO weekly_participation (
+                    user_id, cycle_key, invited_at, response, responded_at
+                )
+                VALUES ($1, $2, NULL, $3, NOW())
+                ON CONFLICT (user_id, cycle_key)
+                DO UPDATE SET
+                    response=EXCLUDED.response,
+                    responded_at=NOW()
+            """, user_id, cycle_key, response)
+
+            # Keep the legacy field in sync while old admin statistics still use it.
+            await conn.execute("""
+                UPDATE users
+                SET confirmed_cycle=$1, updated_at=NOW()
+                WHERE user_id=$2
+            """, cycle_key if response == "yes" else None, user_id)
+
+    return True
+
+
+async def set_confirmed_cycle(user_id: int, cycle_key: str | None) -> None:
+    """Compatibility wrapper for code that still references the legacy field."""
+    if cycle_key is None:
+        assert pool is not None
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE users
+                SET confirmed_cycle=NULL, updated_at=NOW()
+                WHERE user_id=$1
+            """, user_id)
+        return
+
+    await set_weekly_response(user_id, cycle_key, "yes")
 
 
 async def get_confirmed_users(cycle_key: str):
     assert pool is not None
     async with pool.acquire() as conn:
         return await conn.fetch("""
-            SELECT user_id, username, first_name, display_name,
-                   team, responsibility_text
-            FROM users
-            WHERE active=1
-              AND status='active'
-              AND deleted_at IS NULL
-              AND removed_by_admin=0
-              AND profile_migration_required=0
-              AND onboarding_step='completed'
-              AND confirmed_cycle=$1
-            ORDER BY user_id
+            SELECT u.user_id, u.username, u.first_name, u.display_name,
+                   u.team, u.responsibility_text
+            FROM users u
+            JOIN weekly_participation wp
+              ON wp.user_id=u.user_id
+             AND wp.cycle_key=$1
+             AND wp.response='yes'
+            WHERE u.active=1
+              AND u.status='active'
+              AND u.deleted_at IS NULL
+              AND u.removed_by_admin=0
+              AND u.profile_migration_required=0
+              AND u.onboarding_step='completed'
+            ORDER BY u.user_id
         """, cycle_key)
 
 
@@ -920,7 +990,7 @@ def checkin_keyboard(cycle_key: str) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Да ☕️",
+                    text="Да",
                     callback_data=f"rr_yes:{cycle_key}",
                 ),
                 InlineKeyboardButton(
@@ -1138,19 +1208,25 @@ async def maybe_offer_current_week_after_profile_update(user_id: int) -> None:
         return
 
     cycle_key = current_cycle(now)
-    if user["confirmed_cycle"] == cycle_key:
+    if await get_weekly_response(user_id, cycle_key) is not None:
         return
 
     match_status = await get_job_status("random_match", cycle_key)
     if match_status is not None:
         return
 
-    await mark_broadcast_delivered("random_checkin", cycle_key, user_id)
-    await bot.send_message(
-        user_id,
-        "Готов(а) к Random Ristretto на этой неделе?",
-        reply_markup=checkin_keyboard(cycle_key),
-    )
+    try:
+        await bot.send_message(
+            user_id,
+            "Готов(а) к Random Ristretto на этой неделе?",
+            reply_markup=checkin_keyboard(cycle_key),
+        )
+        await record_weekly_invite(user_id, cycle_key)
+        await mark_broadcast_delivered("random_checkin", cycle_key, user_id)
+    except TelegramForbiddenError:
+        await deactivate_unreachable_user(user_id)
+    except Exception:
+        logging.exception("Не удалось отправить текущий check-in после обновления профиля")
 
 
 async def finish_profile_after_responsibility(message: Message, user_id: int, text: str) -> None:
@@ -1555,12 +1631,27 @@ async def delete_me_cancel(callback: CallbackQuery) -> None:
 # RANDOM RISTRETTO: CHECK-IN
 # =========================================================
 async def send_weekly_checkin(cycle_key: str, delivery_job: str = "random_checkin") -> None:
-    await send_broadcast(
-        delivery_job,
-        cycle_key,
-        "Готов(а) к Random Ristretto на этой неделе?",
-        reply_markup=checkin_keyboard(cycle_key),
-    )
+    users = await get_pending_broadcast_users(delivery_job, cycle_key)
+    failures = 0
+
+    for user in users:
+        try:
+            await bot.send_message(
+                user["user_id"],
+                "Готов(а) к Random Ristretto на этой неделе?",
+                reply_markup=checkin_keyboard(cycle_key),
+            )
+            await record_weekly_invite(user["user_id"], cycle_key)
+            await mark_broadcast_delivered(delivery_job, cycle_key, user["user_id"])
+        except TelegramForbiddenError:
+            logging.warning("Пользователь %s заблокировал бота", user["user_id"])
+            await deactivate_unreachable_user(user["user_id"])
+        except Exception:
+            failures += 1
+            logging.exception("Не удалось отправить check-in пользователю %s", user["user_id"])
+
+    if failures:
+        raise RuntimeError(f"Не доставлено check-in сообщений: {failures}")
 
 
 @router.callback_query(F.data.startswith("rr_yes:"))
@@ -1579,10 +1670,7 @@ async def checkin_yes(callback: CallbackQuery) -> None:
         or user["profile_migration_required"] != 0
         or user["onboarding_step"] != "completed"
     ):
-        await callback.answer(
-            "Сначала нужно завершить профиль.",
-            show_alert=True,
-        )
+        await callback.answer("Сначала нужно завершить профиль.", show_alert=True)
         if user and user["profile_migration_required"] == 1:
             await callback.message.answer(
                 "Чтобы участвовать в Ristretto, сначала дополни профиль.",
@@ -1595,7 +1683,11 @@ async def checkin_yes(callback: CallbackQuery) -> None:
         await callback.answer("Запись на эту неделю уже закрыта.", show_alert=True)
         return
 
-    await set_confirmed_cycle(callback.from_user.id, cycle_key)
+    saved = await set_weekly_response(callback.from_user.id, cycle_key, "yes")
+    if not saved:
+        await callback.answer("Сейчас участие недоступно.", show_alert=True)
+        return
+
     await callback.message.edit_text(
         "Есть. Во вторник пришлю твою компанию на эту неделю."
     )
@@ -1610,7 +1702,16 @@ async def checkin_no(callback: CallbackQuery) -> None:
         await callback.answer("Это сообщение относится к другой неделе.", show_alert=True)
         return
 
-    await set_confirmed_cycle(callback.from_user.id, None)
+    match_status = await get_job_status("random_match", cycle_key)
+    if match_status is not None:
+        await callback.answer("Запись на эту неделю уже закрыта.", show_alert=True)
+        return
+
+    saved = await set_weekly_response(callback.from_user.id, cycle_key, "no")
+    if not saved:
+        await callback.answer("Сейчас участие недоступно.", show_alert=True)
+        return
+
     await callback.message.edit_text("Хорошо, пропустим эту неделю.")
     await callback.answer()
 
@@ -1626,6 +1727,281 @@ async def old_checkin_callback(callback: CallbackQuery) -> None:
 # =========================================================
 # RANDOM RISTRETTO: МЭТЧИНГ
 # =========================================================
+def normalized_pair(user_a: int, user_b: int) -> tuple[int, int]:
+    return (user_a, user_b) if user_a < user_b else (user_b, user_a)
+
+
+def pair_team_kind(team_a: str | None, team_b: str | None) -> str | None:
+    if not team_a or not team_b or team_a == "other" or team_b == "other":
+        return None
+    return "same" if team_a == team_b else "cross"
+
+
+def pair_score(
+    user_a: dict,
+    user_b: dict,
+    pair_history: dict[tuple[int, int], dict],
+    user_team_history: dict[int, dict[str, int]],
+) -> tuple[int, int, int, float]:
+    key = normalized_pair(user_a["user_id"], user_b["user_id"])
+    history = pair_history.get(key)
+    is_repeat = 1 if history else 0
+
+    team_penalty = 0
+    kind = pair_team_kind(user_a.get("team"), user_b.get("team"))
+    if kind:
+        for user in (user_a, user_b):
+            counts = user_team_history.get(user["user_id"], {"same": 0, "cross": 0})
+            if kind == "same":
+                team_penalty += counts.get("same", 0) - counts.get("cross", 0)
+            else:
+                team_penalty += counts.get("cross", 0) - counts.get("same", 0)
+
+    repeat_count = int(history["count"]) if history else 0
+    last_matched_ts = history["last_matched_at"].timestamp() if history else 0.0
+    return (is_repeat, team_penalty, repeat_count, last_matched_ts)
+
+
+def group_edges(group: list[dict]) -> list[tuple[dict, dict]]:
+    return [(a, b) for a, b in combinations(group, 2)]
+
+
+def plan_score(
+    groups: list[list[dict]],
+    pair_history: dict[tuple[int, int], dict],
+    user_team_history: dict[int, dict[str, int]],
+) -> tuple[int, int, int, float]:
+    scores = [
+        pair_score(a, b, pair_history, user_team_history)
+        for group in groups
+        for a, b in group_edges(group)
+    ]
+    return (
+        sum(score[0] for score in scores),
+        sum(score[1] for score in scores),
+        sum(score[2] for score in scores),
+        sum(score[3] for score in scores),
+    )
+
+
+def build_match_plan(
+    participants: list[dict],
+    pair_history: dict[tuple[int, int], dict],
+    user_team_history: dict[int, dict[str, int]],
+    cycle_key: str,
+    trials: int = 1200,
+) -> list[list[dict]]:
+    """
+    Heuristic search with lexicographic priorities:
+    1) as few repeated acquaintances as possible;
+    2) soft balance between same-team and cross-team meetings;
+    3) among repeats, rarer repeats first;
+    4) among equally rare repeats, the oldest repeat first.
+
+    Every trial is deterministic for the cycle key, so a restart cannot change the
+    plan before it is persisted to the database.
+    """
+    if len(participants) < 2:
+        return []
+
+    rng = random.Random(f"random-ristretto:{cycle_key}")
+    best_groups: list[list[dict]] | None = None
+    best_score: tuple[int, int, int, float] | None = None
+
+    participant_dicts = [dict(user) for user in participants]
+    trial_count = max(200, trials)
+
+    for _ in range(trial_count):
+        remaining = participant_dicts.copy()
+        rng.shuffle(remaining)
+        groups: list[list[dict]] = []
+
+        while len(remaining) > 3:
+            # Start with the person who currently has the fewest new options.
+            option_rows = []
+            for user in remaining:
+                new_options = sum(
+                    1
+                    for other in remaining
+                    if other["user_id"] != user["user_id"]
+                    and normalized_pair(user["user_id"], other["user_id"]) not in pair_history
+                )
+                option_rows.append((new_options, rng.random(), user))
+            _, _, first = min(option_rows, key=lambda row: (row[0], row[1]))
+            remaining.remove(first)
+
+            candidate_rows = []
+            for other in remaining:
+                score = pair_score(first, other, pair_history, user_team_history)
+                candidate_rows.append((score, rng.random(), other))
+            _, _, second = min(candidate_rows, key=lambda row: (row[0], row[1]))
+            remaining.remove(second)
+            groups.append([first, second])
+
+        if len(remaining) == 3:
+            groups.append(remaining.copy())
+        elif len(remaining) == 2:
+            groups.append(remaining.copy())
+
+        score = plan_score(groups, pair_history, user_team_history)
+        if best_score is None or score < best_score:
+            best_score = score
+            best_groups = [group.copy() for group in groups]
+
+    return best_groups or []
+
+
+async def backfill_match_relationships(conn: asyncpg.Connection) -> None:
+    """Idempotently imports old pair history into the normalized v2 table."""
+    await conn.execute("""
+        INSERT INTO match_relationships (
+            cycle_key, user_a, user_b, group_id, matched_at
+        )
+        SELECT
+            g.cycle_key,
+            LEAST(m1.user_id, m2.user_id),
+            GREATEST(m1.user_id, m2.user_id),
+            g.id,
+            g.created_at
+        FROM match_groups g
+        JOIN match_group_members m1 ON m1.group_id=g.id
+        JOIN match_group_members m2
+          ON m2.group_id=g.id
+         AND m1.user_id < m2.user_id
+        ON CONFLICT (cycle_key, user_a, user_b) DO NOTHING
+    """)
+
+    await conn.execute("""
+        INSERT INTO match_relationships (
+            cycle_key, user_a, user_b, group_id, matched_at
+        )
+        SELECT
+            'legacy-meeting-' || m.id::text,
+            LEAST(m.user1, m.user2),
+            GREATEST(m.user1, m.user2),
+            NULL,
+            m.created_at AT TIME ZONE 'Europe/Istanbul'
+        FROM meetings m
+        JOIN users u1 ON u1.user_id=m.user1
+        JOIN users u2 ON u2.user_id=m.user2
+        WHERE m.user1 IS NOT NULL
+          AND m.user2 IS NOT NULL
+          AND m.user1 <> m.user2
+        ON CONFLICT (cycle_key, user_a, user_b) DO NOTHING
+    """)
+
+
+async def get_match_history(participants: list[asyncpg.Record]) -> tuple[dict, dict]:
+    if not participants:
+        return {}, {}
+
+    participant_ids = [user["user_id"] for user in participants]
+    pair_history: dict[tuple[int, int], dict] = {}
+    user_team_history: dict[int, dict[str, int]] = {
+        user_id: {"same": 0, "cross": 0} for user_id in participant_ids
+    }
+
+    assert pool is not None
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT r.user_a, r.user_b, r.matched_at,
+                   ua.team AS team_a, ub.team AS team_b
+            FROM match_relationships r
+            JOIN users ua ON ua.user_id=r.user_a
+            JOIN users ub ON ub.user_id=r.user_b
+            WHERE r.user_a = ANY($1::bigint[])
+               OR r.user_b = ANY($1::bigint[])
+            ORDER BY r.matched_at
+        """, participant_ids)
+
+    participant_id_set = set(participant_ids)
+    for row in rows:
+        key = normalized_pair(row["user_a"], row["user_b"])
+        if row["user_a"] in participant_id_set and row["user_b"] in participant_id_set:
+            info = pair_history.setdefault(key, {"count": 0, "last_matched_at": row["matched_at"]})
+            info["count"] += 1
+            if row["matched_at"] > info["last_matched_at"]:
+                info["last_matched_at"] = row["matched_at"]
+
+        kind = pair_team_kind(row["team_a"], row["team_b"])
+        if kind:
+            if row["user_a"] in participant_id_set:
+                user_team_history[row["user_a"]][kind] += 1
+            if row["user_b"] in participant_id_set:
+                user_team_history[row["user_b"]][kind] += 1
+
+    return pair_history, user_team_history
+
+
+async def choose_group_icebreaker(
+    conn: asyncpg.Connection,
+    member_ids: list[int],
+    cycle_key: str,
+    group_index: int,
+) -> tuple[str, int | None]:
+    """
+    Uses the approved DB pool when it is populated. Until the approved 100-question
+    pool is loaded, the legacy in-code list remains a temporary fallback.
+    """
+    active = await conn.fetch("""
+        SELECT id, text
+        FROM icebreakers
+        WHERE active=1
+        ORDER BY id
+    """)
+
+    if not active:
+        rng = random.Random(f"{cycle_key}:icebreaker:{group_index}")
+        return rng.choice(ICEBREAKERS), None
+
+    active_ids = [row["id"] for row in active]
+    active_count = len(active_ids)
+
+    # Reset an individual cycle only after that person has seen the whole active pool.
+    for user_id in member_ids:
+        used_count = await conn.fetchval("""
+            SELECT COUNT(*)
+            FROM user_icebreakers ui
+            WHERE ui.user_id=$1
+              AND ui.icebreaker_id = ANY($2::bigint[])
+        """, user_id, active_ids)
+        if used_count >= active_count:
+            await conn.execute("""
+                DELETE FROM user_icebreakers
+                WHERE user_id=$1
+                  AND icebreaker_id = ANY($2::bigint[])
+            """, user_id, active_ids)
+
+    used_rows = await conn.fetch("""
+        SELECT user_id, icebreaker_id
+        FROM user_icebreakers
+        WHERE user_id = ANY($1::bigint[])
+          AND icebreaker_id = ANY($2::bigint[])
+    """, member_ids, active_ids)
+    used_by_user: dict[int, set[int]] = {user_id: set() for user_id in member_ids}
+    for row in used_rows:
+        used_by_user[row["user_id"]].add(row["icebreaker_id"])
+
+    candidates = [
+        row for row in active
+        if all(row["id"] not in used_by_user[user_id] for user_id in member_ids)
+    ]
+
+    if not candidates:
+        # Extremely rare intersection exhaustion for a shared group question.
+        # Start a fresh shared cycle for this group instead of failing the match run.
+        await conn.execute("""
+            DELETE FROM user_icebreakers
+            WHERE user_id = ANY($1::bigint[])
+              AND icebreaker_id = ANY($2::bigint[])
+        """, member_ids, active_ids)
+        candidates = list(active)
+
+    rng = random.Random(f"{cycle_key}:icebreaker:{group_index}")
+    chosen = rng.choice(candidates)
+    return chosen["text"], chosen["id"]
+
+
 async def create_match_groups_if_needed(cycle_key: str) -> int:
     assert pool is not None
 
@@ -1641,29 +2017,59 @@ async def create_match_groups_if_needed(cycle_key: str) -> int:
     if len(users) < 2:
         return 0
 
-    random.shuffle(users)
-    groups: list[list[asyncpg.Record]] = []
-
-    while len(users) >= 2:
-        groups.append([users.pop(), users.pop()])
-
-    if users and groups:
-        groups[-1].append(users.pop())
+    pair_history, user_team_history = await get_match_history(users)
+    groups = build_match_plan(
+        [dict(user) for user in users],
+        pair_history,
+        user_team_history,
+        cycle_key,
+    )
 
     async with pool.acquire() as conn:
         async with conn.transaction():
-            for group in groups:
+            # A second guard makes the operation idempotent if two processes race.
+            existing = await conn.fetchval(
+                "SELECT COUNT(*) FROM match_groups WHERE cycle_key=$1",
+                cycle_key,
+            )
+            if existing:
+                return existing
+
+            for group_index, group in enumerate(groups):
+                member_ids = [user["user_id"] for user in group]
+                topic, icebreaker_id = await choose_group_icebreaker(
+                    conn, member_ids, cycle_key, group_index
+                )
+
                 group_id = await conn.fetchval("""
                     INSERT INTO match_groups (cycle_key, topic, created_at)
                     VALUES ($1, $2, NOW())
                     RETURNING id
-                """, cycle_key, random.choice(ICEBREAKERS))
+                """, cycle_key, topic)
 
                 for user in group:
                     await conn.execute("""
                         INSERT INTO match_group_members (group_id, user_id, cycle_key)
                         VALUES ($1, $2, $3)
                     """, group_id, user["user_id"], cycle_key)
+
+                for user_a, user_b in combinations(group, 2):
+                    pair_a, pair_b = normalized_pair(user_a["user_id"], user_b["user_id"])
+                    await conn.execute("""
+                        INSERT INTO match_relationships (
+                            cycle_key, user_a, user_b, group_id, matched_at
+                        )
+                        VALUES ($1, $2, $3, $4, NOW())
+                        ON CONFLICT (cycle_key, user_a, user_b) DO NOTHING
+                    """, cycle_key, pair_a, pair_b, group_id)
+
+                if icebreaker_id is not None:
+                    for user_id in member_ids:
+                        await conn.execute("""
+                            INSERT INTO user_icebreakers (user_id, icebreaker_id, used_at)
+                            VALUES ($1, $2, NOW())
+                            ON CONFLICT (user_id, icebreaker_id) DO NOTHING
+                        """, user_id, icebreaker_id)
 
     return len(groups)
 
@@ -1679,6 +2085,8 @@ async def get_match_groups(cycle_key: str) -> list[dict]:
                 u.username,
                 u.first_name,
                 u.display_name,
+                u.team,
+                u.responsibility_text,
                 CASE WHEN n.user_id IS NULL THEN 0 ELSE 1 END AS notified
             FROM match_groups g
             JOIN match_group_members m ON m.group_id=g.id
@@ -1710,6 +2118,16 @@ async def mark_match_notified(group_id: int, user_id: int) -> None:
         """, group_id, user_id)
 
 
+def match_profile_block(user: asyncpg.Record | dict) -> str:
+    lines = [
+        profile_title(user),
+        f"Отвечает за: {(user['responsibility_text'] or '').strip()}",
+    ]
+    if user["username"]:
+        lines.append(f"@{user['username']}")
+    return "\n".join(lines)
+
+
 async def notify_lone_participant(cycle_key: str, user: asyncpg.Record) -> None:
     job_name = "random_match_solo"
     assert pool is not None
@@ -1726,8 +2144,8 @@ async def notify_lone_participant(cycle_key: str, user: asyncpg.Record) -> None:
     try:
         await bot.send_message(
             user["user_id"],
-            "☕️ На этой неделе не получилось собрать пару для Random Ristretto. "
-            "Попробуем снова на следующей неделе.",
+            "На этой неделе коллеги без кофеина, для Ristretto не нашлось компании.\n\n"
+            "Попробуем снова в следующий понедельник.",
         )
         await mark_broadcast_delivered(job_name, cycle_key, user["user_id"])
     except TelegramForbiddenError:
@@ -1757,17 +2175,18 @@ async def run_matching(cycle_key: str) -> None:
                 continue
 
             others = [
-                contact_name(other)
+                match_profile_block(other)
                 for other in group["members"]
                 if other["user_id"] != member["user_id"]
             ]
 
             text = (
-                "☕️ Твой Random Ristretto на этой неделе\n\n"
-                + "\n".join(others)
-                + "\n\nНапишите друг другу напрямую в Telegram ☕️\n\n"
-                + "Тема для старта:\n"
-                + f"— {group['topic']}"
+                "Твоя компания для Ristretto на этой неделе:\n\n"
+                + "\n\n".join(others)
+                + "\n\nНапишите друг другу в Telegram или TAG — как удобнее.\n\n"
+                + "На случай тех самых тихих 30 секунд в начале — "
+                  "вот необязательная тема для старта:\n"
+                + group["topic"]
             )
 
             try:
@@ -1781,6 +2200,7 @@ async def run_matching(cycle_key: str) -> None:
 
     if failures:
         raise RuntimeError(f"Не доставлено результатов мэтчинга: {failures}")
+
 
 # =========================================================
 # БЛАГОДАРНОСТИ: СБОР
