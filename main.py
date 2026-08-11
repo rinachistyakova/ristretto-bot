@@ -2372,24 +2372,84 @@ async def run_matching(cycle_key: str) -> None:
 # =========================================================
 THANKS_PUBLIC_LIMIT = 200
 
-THANKS_ALIASES = {
-    "катя": {"екатерина", "катерина"},
-    "катерина": {"екатерина", "катя"},
-    "екатерина": {"катя", "катерина"},
-    "таня": {"татьяна"},
-    "татьяна": {"таня"},
-    "настя": {"анастасия"},
-    "анастасия": {"настя"},
-    "дима": {"дмитрий"},
-    "дмитрий": {"дима"},
-    "леша": {"алексей"},
-    "лёша": {"алексей"},
-    "алексей": {"леша", "лёша"},
-    "коля": {"николай"},
-    "николай": {"коля"},
-    "маша": {"мария"},
-    "мария": {"маша"},
-}
+# Имя можно искать в любом регистре. Все варианты ниже автоматически
+# приводятся к casefold() и "ё" -> "е", поэтому Катя/катя/КАТЯ и
+# Лёша/леша обрабатываются одинаково.
+NAME_ALIAS_GROUPS = [
+    {"Антонина", "Тоня", "Antonina", "Tonya"},
+    {"Елена", "Лена", "Elena", "Lena"},
+    {"Полина", "Polina"},
+    {"Данила", "Даня", "Danila", "Danya"},
+    {"Филипп", "Филя", "Filipp", "Philipp"},
+    {"Алёна", "Алена", "Alyona", "Alena"},
+    {"Татьяна", "Таня", "Tatyana", "Tatiana", "Tanya"},
+    {"Юлия", "Юля", "Julia", "Yulia"},
+    {"Евгений", "Женя", "Evgeny", "Evgeniy", "Eugene", "Zhenya"},
+    {"Ольга", "Оля", "Olga", "Olya"},
+    {"Анна", "Аня", "Anna", "Anya"},
+    {"Павел", "Паша", "Pavel", "Pasha"},
+    {"Ирина", "Ира", "Irina", "Ira"},
+    {"Николай", "Коля", "Nikolay", "Nikolai", "Kolya"},
+    {"Дмитрий", "Дима", "Dmitry", "Dmitriy", "Dima"},
+    {"Анастасия", "Настя", "Anastasia", "Anastasiya", "Anastasiia", "Nastya"},
+    {"Дарья", "Даша", "Daria", "Darya", "Dasha"},
+    {"Вера", "Vera"},
+    {"Артём", "Артем", "Тёма", "Тема", "Artem", "Artyom", "Tyoma"},
+    {"Айна", "Aina"},
+    {"Евгения", "Женя", "Eugenia", "Evgenia", "Zhenya"},
+    {"Яна", "Yana"},
+    {"Влада", "Vlada"},
+    {"Ксения", "Ксюша", "Ksenia", "Xenia", "Ksyusha"},
+    {"Елизавета", "Лиза", "Elizaveta", "Liza"},
+    {"Диана", "Diana"},
+    {"Вадим", "Vadim"},
+    {"Валерия", "Лера", "Valeria", "Valeriya", "Lera"},
+    {"Виктория", "Вика", "Victoria", "Viktoria", "Vika"},
+    {"Екатерина", "Катерина", "Катя", "Ekaterina", "Katerina", "Kat", "Kate", "Katya"},
+    {"Мария", "Маша", "Maria", "Masha"},
+    {"Роман", "Рома", "Roman", "Roma"},
+    {"Андрей", "Andrey", "Andrei", "Andrew"},
+    {"Никита", "Nikita"},
+    {"Любовь", "Люба", "Lyubov", "Liubov", "Lyuba"},
+    {"Таисия", "Тася", "Тая", "Taisia", "Tasya", "Taya"},
+    {"Дамир", "Damir"},
+    {"Сергей", "Серёжа", "Сережа", "Sergey", "Sergei", "Serezha"},
+    {"Светлана", "Света", "Svetlana", "Sveta"},
+    {"Зинаида", "Зина", "Zinaida", "Zina"},
+    {"Алексей", "Лёша", "Леша", "Alexey", "Aleksey", "Lesha"},
+    {"Тамара", "Тома", "Tamara", "Toma"},
+    {"Илья", "Ilya", "Ilia"},
+    {"Ляйсан", "Ляся", "Lyasyan", "Laysan", "Lyasya"},
+    {"Людмила", "Люся", "Люда", "Ludmila", "Lyudmila", "Liudmila", "Lyusya", "Lyuda"},
+
+    # Небольшой резерв для распространённых имён, которых пока может не быть
+    # среди текущих участников.
+    {"Александр", "Саша", "Alexander", "Aleksandr", "Sasha"},
+    {"Александра", "Саша", "Alexandra", "Aleksandra", "Sasha"},
+    {"Михаил", "Миша", "Mikhail", "Misha"},
+    {"Максим", "Макс", "Maksim", "Maxim", "Max"},
+    {"Владимир", "Вова", "Vladimir", "Vova"},
+    {"Наталья", "Наташа", "Natalia", "Natalya", "Natasha"},
+    {"Надежда", "Надя", "Nadezhda", "Nadya"},
+    {"Маргарита", "Рита", "Margarita", "Rita"},
+]
+
+
+def _normalize_alias_literal(value: str) -> str:
+    return " ".join((value or "").casefold().replace("ё", "е").split())
+
+
+THANKS_ALIASES: dict[str, set[str]] = {}
+for _group in NAME_ALIAS_GROUPS:
+    _normalized_group = {
+        _normalize_alias_literal(item)
+        for item in _group
+        if _normalize_alias_literal(item)
+    }
+    for _name in _normalized_group:
+        THANKS_ALIASES.setdefault(_name, set()).update(
+            _normalized_group - {_name}
+        )
 
 
 def truncate_public_thanks(text: str, limit: int = THANKS_PUBLIC_LIMIT) -> str:
