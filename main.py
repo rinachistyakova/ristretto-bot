@@ -1,4 +1,4 @@
-print("RUNNING FILE: MAIN.PY V2 PROFILES + MATCHING + THANKS + ADMIN")
+print("RUNNING FILE: MAIN.PY V2 PROFILES + MATCHING + THANKS + ADMIN + RELIABILITY")
 
 import asyncio
 import logging
@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 from v2_foundation import ensure_v2_foundation
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramForbiddenError
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
@@ -53,6 +53,11 @@ THANKS_DIGEST_WEEKDAY = 4
 THANKS_REVIEW_HOUR = 15
 THANKS_DIGEST_HOUR = 16
 
+# Safe outgoing pacing. This is deliberately conservative for a team bot.
+OUTGOING_PACE_SECONDS = 0.09
+RETRY_AFTER_MARGIN_SECONDS = 0.5
+MAX_RETRY_AFTER_ATTEMPTS = 3
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -62,6 +67,8 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
 pool: asyncpg.Pool | None = None
+_send_lock = asyncio.Lock()
+_last_send_monotonic = 0.0
 
 ICEBREAKERS = [
     "Какой город идеально подходит для одного ristretto?",
@@ -853,6 +860,42 @@ async def clear_flow(user_id: int) -> None:
         await conn.execute("DELETE FROM user_flows WHERE user_id=$1", user_id)
 
 # =========================================================
+# НАДЁЖНАЯ ОТПРАВКА В TELEGRAM
+# =========================================================
+async def safe_send_message(chat_id: int, text: str, **kwargs):
+    """
+    Serializes proactive sends, keeps a small delay between them and respects
+    Telegram RetryAfter without turning a transient flood-limit into a failed job.
+    TelegramForbiddenError is intentionally not swallowed: callers already mark
+    that user's delivery channel as unavailable.
+    """
+    global _last_send_monotonic
+
+    for attempt in range(MAX_RETRY_AFTER_ATTEMPTS + 1):
+        try:
+            async with _send_lock:
+                loop = asyncio.get_running_loop()
+                wait_for = OUTGOING_PACE_SECONDS - (loop.time() - _last_send_monotonic)
+                if wait_for > 0:
+                    await asyncio.sleep(wait_for)
+
+                result = await bot.send_message(chat_id, text, **kwargs)
+                _last_send_monotonic = loop.time()
+                return result
+
+        except TelegramRetryAfter as exc:
+            if attempt >= MAX_RETRY_AFTER_ATTEMPTS:
+                raise
+            delay = max(float(exc.retry_after), 0.0) + RETRY_AFTER_MARGIN_SECONDS
+            logging.warning(
+                "Telegram flood limit for chat %s; retry in %.1f sec",
+                chat_id,
+                delay,
+            )
+            await asyncio.sleep(delay)
+
+
+# =========================================================
 # ЗАЩИТА ПЛАНИРОВЩИКА ОТ ПОВТОРОВ
 # =========================================================
 async def claim_job(job_name: str, cycle_key: str) -> bool:
@@ -975,7 +1018,7 @@ async def send_broadcast(
 
     for user in users:
         try:
-            await bot.send_message(
+            await safe_send_message(
                 user["user_id"],
                 text,
                 reply_markup=reply_markup,
@@ -1003,7 +1046,7 @@ async def send_broadcast_chunks(
     for user in users:
         try:
             for chunk in chunks:
-                await bot.send_message(user["user_id"], chunk)
+                await safe_send_message(user["user_id"], chunk)
             await mark_broadcast_delivered(job_name, cycle_key, user["user_id"])
         except TelegramForbiddenError:
             logging.warning("Пользователь %s заблокировал бота", user["user_id"])
@@ -1199,7 +1242,7 @@ async def notify_owner_pending_activation(user_id: int) -> None:
     )
 
     try:
-        await bot.send_message(
+        await safe_send_message(
             ADMIN_ID,
             text,
             reply_markup=pending_activation_keyboard(user_id),
@@ -1230,7 +1273,7 @@ async def maybe_offer_current_week_after_profile_update(user_id: int) -> None:
         return
 
     try:
-        await bot.send_message(
+        await safe_send_message(
             user_id,
             "Готов(а) к Random Ristretto на этой неделе?",
             reply_markup=checkin_keyboard(cycle_key),
@@ -1544,7 +1587,7 @@ async def admin_activate_callback(callback: CallbackQuery) -> None:
     )
 
     try:
-        await bot.send_message(
+        await safe_send_message(
             user_id,
             "Готово, доступ открыт.\n\n"
             "По понедельникам я буду спрашивать, готов(а) ли ты к Ristretto на этой неделе.\n"
@@ -1587,7 +1630,7 @@ async def admin_deny_activation_callback(callback: CallbackQuery) -> None:
     )
 
     try:
-        await bot.send_message(user_id, access_denied_message())
+        await safe_send_message(user_id, access_denied_message())
     except Exception:
         logging.exception("Не удалось сообщить пользователю об отказе в доступе")
 
@@ -1676,7 +1719,7 @@ async def send_weekly_checkin(cycle_key: str, delivery_job: str = "random_checki
 
     for user in users:
         try:
-            await bot.send_message(
+            await safe_send_message(
                 user["user_id"],
                 "Готов(а) к Random Ristretto на этой неделе?",
                 reply_markup=checkin_keyboard(cycle_key),
@@ -2182,7 +2225,7 @@ async def notify_lone_participant(cycle_key: str, user: asyncpg.Record) -> None:
         return
 
     try:
-        await bot.send_message(
+        await safe_send_message(
             user["user_id"],
             "На этой неделе коллеги без кофеина, для Ristretto не нашлось компании.\n\n"
             "Попробуем снова в следующий понедельник.",
@@ -2230,7 +2273,7 @@ async def run_matching(cycle_key: str) -> None:
             )
 
             try:
-                await bot.send_message(member["user_id"], text)
+                await safe_send_message(member["user_id"], text)
                 await mark_match_notified(group["group_id"], member["user_id"])
             except TelegramForbiddenError:
                 await deactivate_unreachable_user(member["user_id"])
@@ -2965,7 +3008,7 @@ async def notify_public_thanks_moderation(thanks_id: int) -> None:
         f"«{row['public_text'] or truncate_public_thanks(row['message_text'])}»"
     )
     try:
-        await bot.send_message(
+        await safe_send_message(
             ADMIN_ID,
             text,
             reply_markup=thanks_moderation_keyboard(thanks_id),
@@ -3495,7 +3538,7 @@ async def prepare_friday_highlights(cycle_key: str) -> None:
         """, cycle_key)
 
     try:
-        await bot.send_message(
+        await safe_send_message(
             ADMIN_ID,
             "Пятничные хайлайты готовы\n\n"
             f"В общий дайджест собрал {public_count} благодарностей.\n"
@@ -3631,7 +3674,7 @@ async def send_personal_thanks(cycle_key: str) -> None:
             continue
 
         try:
-            await bot.send_message(
+            await safe_send_message(
                 row["recipient_id"],
                 f"Тебе спасибо от {clean_name(row['sender_name'])} 🤍\n\n"
                 f"«{row['message_text']}»",
@@ -3717,7 +3760,7 @@ async def publish_approved_digest(cycle_key: str) -> bool:
                 continue
 
             try:
-                await bot.send_message(recipient["user_id"], chunk)
+                await safe_send_message(recipient["user_id"], chunk)
                 async with pool.acquire() as conn:
                     await conn.execute("""
                         INSERT INTO digest_deliveries (
@@ -4186,7 +4229,7 @@ async def admin_remove_confirm_callback(callback: CallbackQuery) -> None:
         await refresh_admin_cache()
         await callback.message.edit_text("Доступ пользователю закрыт.")
         try:
-            await bot.send_message(user_id, access_denied_message())
+            await safe_send_message(user_id, access_denied_message())
         except Exception:
             logging.exception("Не удалось сообщить пользователю о закрытии доступа")
     else:
@@ -4240,7 +4283,7 @@ async def admin_restore_callback(callback: CallbackQuery) -> None:
     await audit_admin_action(callback.from_user.id, "restore_access", user_id, "user", user_id)
     await callback.message.answer("Пользователь переведён на восстановление доступа.")
     try:
-        await bot.send_message(
+        await safe_send_message(
             user_id,
             "Ты можешь вернуться к Random Ristretto.\n\n"
             "Для начала обновим профиль — всего три коротких шага.\n\n"
@@ -4623,7 +4666,7 @@ async def send_profile_migration_requests() -> int:
     sent = 0
     for user in users:
         try:
-            await bot.send_message(
+            await safe_send_message(
                 user["user_id"],
                 "Random Ristretto немного подрос.\n\n"
                 "Нас становится больше, поэтому теперь перед встречей я буду показывать "
@@ -4878,52 +4921,90 @@ async def flow_message_handler(message: Message) -> None:
 
 
 # =========================================================
-# ПЛАНИРОВЩИК
+# ПЛАНИРОВЩИК: CATCH-UP ПОСЛЕ РЕСТАРТА
 # =========================================================
+def week_minute(moment: datetime) -> int:
+    return moment.weekday() * 24 * 60 + moment.hour * 60 + moment.minute
+
+
+def scheduler_new_run_due(job_name: str, moment: datetime) -> bool:
+    """
+    Window for a job that has never started in the current cycle.
+    A restart after the exact scheduled minute therefore does not lose the job.
+    Windows that would become confusing when very late are deliberately bounded.
+    """
+    minute = week_minute(moment)
+    checkin_start = CHECKIN_WEEKDAY * 24 * 60 + CHECKIN_HOUR * 60
+    match_start = MATCH_WEEKDAY * 24 * 60 + MATCH_HOUR * 60
+    reminder_start = THANKS_REMINDER_WEEKDAY * 24 * 60 + THANKS_REMINDER_HOUR * 60
+    review_start = THANKS_DIGEST_WEEKDAY * 24 * 60 + THANKS_REVIEW_HOUR * 60
+    delivery_start = THANKS_DIGEST_WEEKDAY * 24 * 60 + THANKS_DIGEST_HOUR * 60
+
+    if job_name == "random_checkin":
+        return checkin_start <= minute < match_start
+    if job_name == "random_match":
+        return match_start <= minute < reminder_start
+    if job_name == "thanks_reminder":
+        return reminder_start <= minute < review_start
+    if job_name == "thanks_digest_prepare":
+        return minute >= review_start
+    if job_name == "thanks_friday_delivery":
+        return minute >= delivery_start
+    return False
+
+
+def scheduler_retry_due(job_name: str, moment: datetime) -> bool:
+    """A failed/stale job may retry after its start, while check-in still closes at matching."""
+    minute = week_minute(moment)
+    checkin_start = CHECKIN_WEEKDAY * 24 * 60 + CHECKIN_HOUR * 60
+    match_start = MATCH_WEEKDAY * 24 * 60 + MATCH_HOUR * 60
+    reminder_start = THANKS_REMINDER_WEEKDAY * 24 * 60 + THANKS_REMINDER_HOUR * 60
+    review_start = THANKS_DIGEST_WEEKDAY * 24 * 60 + THANKS_REVIEW_HOUR * 60
+    delivery_start = THANKS_DIGEST_WEEKDAY * 24 * 60 + THANKS_DIGEST_HOUR * 60
+
+    if job_name == "random_checkin":
+        return checkin_start <= minute < match_start
+    if job_name == "random_match":
+        return minute >= match_start
+    if job_name == "thanks_reminder":
+        return reminder_start <= minute < review_start
+    if job_name == "thanks_digest_prepare":
+        return minute >= review_start
+    if job_name == "thanks_friday_delivery":
+        return minute >= delivery_start
+    return False
+
+
+async def scheduler_should_attempt(job_name: str, cycle_key: str, moment: datetime) -> bool:
+    status = await get_job_status(job_name, cycle_key)
+    if status == "completed":
+        return False
+    if status in {"failed", "running"}:
+        return scheduler_retry_due(job_name, moment)
+    return scheduler_new_run_due(job_name, moment)
+
+
+async def run_due_scheduler_jobs(moment: datetime | None = None) -> None:
+    now = moment or datetime.now(TZ)
+    cycle_key = current_cycle(now)
+
+    jobs = [
+        ("random_checkin", lambda: send_weekly_checkin(cycle_key)),
+        ("random_match", lambda: run_matching(cycle_key)),
+        ("thanks_reminder", lambda: send_thanks_reminder(cycle_key)),
+        ("thanks_digest_prepare", lambda: prepare_friday_highlights(cycle_key)),
+        ("thanks_friday_delivery", lambda: friday_delivery(cycle_key)),
+    ]
+
+    for job_name, action in jobs:
+        if await scheduler_should_attempt(job_name, cycle_key, now):
+            await run_job_once(job_name, cycle_key, action)
+
+
 async def scheduler_loop() -> None:
     while True:
         try:
-            now = datetime.now(TZ)
-            cycle_key = current_cycle(now)
-
-            if now.weekday() == CHECKIN_WEEKDAY and now.hour == CHECKIN_HOUR:
-                await run_job_once(
-                    "random_checkin",
-                    cycle_key,
-                    lambda: send_weekly_checkin(cycle_key),
-                )
-
-            if now.weekday() == MATCH_WEEKDAY and now.hour == MATCH_HOUR:
-                await run_job_once(
-                    "random_match",
-                    cycle_key,
-                    lambda: run_matching(cycle_key),
-                )
-
-            if (
-                now.weekday() == THANKS_REMINDER_WEEKDAY
-                and now.hour == THANKS_REMINDER_HOUR
-            ):
-                await run_job_once(
-                    "thanks_reminder",
-                    cycle_key,
-                    lambda: send_thanks_reminder(cycle_key),
-                )
-
-            if now.weekday() == THANKS_DIGEST_WEEKDAY and now.hour == THANKS_REVIEW_HOUR:
-                await run_job_once(
-                    "thanks_digest_prepare",
-                    cycle_key,
-                    lambda: prepare_friday_highlights(cycle_key),
-                )
-
-            if now.weekday() == THANKS_DIGEST_WEEKDAY and now.hour == THANKS_DIGEST_HOUR:
-                await run_job_once(
-                    "thanks_friday_delivery",
-                    cycle_key,
-                    lambda: friday_delivery(cycle_key),
-                )
-
+            await run_due_scheduler_jobs()
         except asyncio.CancelledError:
             raise
         except Exception:
