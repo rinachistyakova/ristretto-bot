@@ -2799,7 +2799,7 @@ async def begin_thanks(message: Message, sender_id: int) -> None:
     await set_flow(sender_id, "thanks", "waiting_recipient_query")
     await message.answer(
         "Кого хочешь поблагодарить?\n\n"
-        "Напиши имя, фамилию или @username. Можно как помнишь :)"
+        "Напиши имя или @username. Можно как помнишь :)"
     )
 
 
@@ -2818,7 +2818,7 @@ async def thanks_start_callback(callback: CallbackQuery) -> None:
 async def thanks_search_again_callback(callback: CallbackQuery) -> None:
     await set_flow(callback.from_user.id, "thanks", "waiting_recipient_query")
     await callback.message.answer(
-        "Напиши имя, фамилию или @username. Можно как помнишь :)"
+        "Напиши имя или @username. Можно как помнишь :)"
     )
     await callback.answer()
 
