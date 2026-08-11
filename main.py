@@ -2409,6 +2409,7 @@ NAME_ALIAS_GROUPS = [
     {"Мария", "Маша", "Maria", "Masha"},
     {"Роман", "Рома", "Roman", "Roma"},
     {"Андрей", "Andrey", "Andrei", "Andrew"},
+    {"Ника", "Nika"},
     {"Никита", "Nikita"},
     {"Любовь", "Люба", "Lyubov", "Liubov", "Lyuba"},
     {"Таисия", "Тася", "Тая", "Taisia", "Tasya", "Taya"},
