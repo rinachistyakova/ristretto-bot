@@ -1,4 +1,4 @@
-print("RUNNING FILE: MAIN.PY V2 PROFILES + MATCHING + THANKS + ADMIN + RELIABILITY")
+print("RUNNING FILE: MAIN.PY V2 PROFILES + MATCHING + THANKS + ADMIN + RELIABILITY + COMMANDS")
 
 import asyncio
 import logging
@@ -18,6 +18,9 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.types import (
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeChat,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -108,6 +111,71 @@ async def refresh_admin_cache() -> None:
               AND removed_by_admin=0
         """)
     ADMIN_USER_IDS = {ADMIN_ID, *(row["user_id"] for row in rows)}
+
+
+USER_BOT_COMMANDS = [
+    BotCommand(command="start", description="Открыть Random Ristretto"),
+    BotCommand(command="thanks", description="Поблагодарить коллегу"),
+    BotCommand(command="profile", description="Мой профиль"),
+    BotCommand(command="blocked", description="Заблокированные отправители"),
+    BotCommand(command="leave", description="Поставить рассылки на паузу"),
+    BotCommand(command="resume", description="Вернуть автоматические сообщения"),
+    BotCommand(command="help", description="Что умеет бот"),
+    BotCommand(command="delete_me", description="Удалить профиль"),
+]
+
+
+async def configure_bot_commands() -> None:
+    """Keep the Telegram command menu aligned with the user's role."""
+    await bot.set_my_commands(
+        USER_BOT_COMMANDS,
+        scope=BotCommandScopeAllPrivateChats(),
+    )
+    admin_commands = USER_BOT_COMMANDS + [
+        BotCommand(command="admin", description="Админка Random Ristretto"),
+    ]
+    for admin_id in ADMIN_USER_IDS:
+        await bot.set_my_commands(
+            admin_commands,
+            scope=BotCommandScopeChat(chat_id=admin_id),
+        )
+
+
+def user_help_text(user: asyncpg.Record | dict | None) -> str:
+    if not user:
+        return "Сначала отправь /start — познакомимся и создадим профиль."
+
+    if user["status"] == "access_denied":
+        return access_denied_message()
+
+    if user["status"] == "self_deleted" or user["deleted_at"] is not None:
+        return "Профиль удалён. Если захочешь вернуться, отправь /start."
+
+    if user["status"] == "pending_activation":
+        if user["onboarding_step"] != "completed":
+            return (
+                "Сначала закончим профиль. Отправь /start — я продолжу с того шага, "
+                "на котором мы остановились."
+            )
+        return "Профиль готов и ждёт активации администратора."
+
+    intro = "Random Ristretto на паузе, но ручные команды доступны." if user["status"] == "paused" else "Random Ristretto"
+    migration_note = (
+        "\n\nЧтобы участвовать в Ristretto, нужно один раз дополнить профиль через /profile."
+        if user["profile_migration_required"] == 1
+        else ""
+    )
+    return (
+        f"{intro}\n\n"
+        "/thanks — поблагодарить коллегу\n"
+        "/profile — посмотреть или изменить профиль\n"
+        "/blocked — посмотреть и снять блокировки благодарностей\n"
+        "/leave — поставить автоматические сообщения на паузу\n"
+        "/resume — вернуть автоматические сообщения\n"
+        "/help — показать эту памятку\n"
+        "/delete_me — удалить профиль из бота"
+        f"{migration_note}"
+    )
 
 
 def current_cycle(moment: datetime | None = None) -> str:
@@ -649,6 +717,12 @@ async def anonymize_self(user_id: int) -> None:
                 WHERE user_id=$1
             """, user_id)
 
+    await refresh_admin_cache()
+    try:
+        await configure_bot_commands()
+    except Exception:
+        logging.exception("Не удалось обновить меню команд после удаления профиля")
+
 
 async def remove_user_by_admin(user_id: int) -> bool:
     if user_id == ADMIN_ID:
@@ -663,6 +737,7 @@ async def remove_user_by_admin(user_id: int) -> bool:
                 SET active=0,
                     confirmed_cycle=NULL,
                     status='access_denied',
+                    role='user',
                     removed_by_admin=1,
                     deleted_at=NULL,
                     access_denied_at=NOW(),
@@ -670,7 +745,15 @@ async def remove_user_by_admin(user_id: int) -> bool:
                     updated_at=NOW()
                 WHERE user_id=$1
             """, user_id)
-            return result.endswith("1")
+
+    changed = result.endswith("1")
+    if changed:
+        await refresh_admin_cache()
+        try:
+            await configure_bot_commands()
+        except Exception:
+            logging.exception("Не удалось обновить меню команд после закрытия доступа")
+    return changed
 
 
 async def deactivate_unreachable_user(user_id: int) -> None:
@@ -1081,7 +1164,7 @@ def checkin_keyboard(cycle_key: str) -> InlineKeyboardMarkup:
 def thanks_start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Отправить благодарность", callback_data="thanks_start")]
+            [InlineKeyboardButton(text="Поблагодарить коллегу", callback_data="thanks_start")]
         ]
     )
 
@@ -1355,14 +1438,7 @@ async def start(message: Message) -> None:
             await send_profile_step(message, user)
         return
 
-    await message.answer(
-        "Random Ristretto готов.\n\n"
-        "Команды:\n"
-        "/thanks — поблагодарить коллегу\n"
-        "/profile — мой профиль\n"
-        "/leave — поставить бот на паузу\n"
-        "/resume — вернуться"
-    )
+    await message.answer(user_help_text(user))
 
 
 @router.callback_query(F.data == "profile_migration_start")
@@ -1462,6 +1538,12 @@ async def profile_command(message: Message) -> None:
         return
 
     await show_profile(message, user)
+
+
+@router.message(Command("help"))
+async def help_command(message: Message) -> None:
+    user = await get_user(message.from_user.id)
+    await message.answer(user_help_text(user))
 
 
 @router.message(Command("name"))
@@ -1592,7 +1674,7 @@ async def admin_activate_callback(callback: CallbackQuery) -> None:
             "Готово, доступ открыт.\n\n"
             "По понедельникам я буду спрашивать, готов(а) ли ты к Ristretto на этой неделе.\n"
             "По средам — напоминать, что можно отправить кому-нибудь спасибо.\n\n"
-            "Команды: /thanks, /profile, /leave"
+            "Команды: /thanks, /profile, /blocked, /leave, /resume, /help"
         )
     except Exception:
         logging.exception("Не удалось сообщить пользователю об активации")
@@ -4444,6 +4526,10 @@ async def set_user_role(target_user_id: int, role: str, actor_id: int) -> tuple[
                 ) VALUES ($1, $2, $3, 'user', $3, '{}'::jsonb, NOW())
             """, actor_id, "add_admin" if role == "admin" else "remove_admin", target_user_id)
     await refresh_admin_cache()
+    try:
+        await configure_bot_commands()
+    except Exception:
+        logging.exception("Не удалось обновить меню команд после изменения роли")
     return True, "Роль администратора добавлена." if role == "admin" else "Роль администратора снята."
 
 
@@ -4780,14 +4866,7 @@ async def flow_message_handler(message: Message) -> None:
             await message.answer(access_denied_message())
             return
 
-        await message.answer(
-            "Доступные команды:\n"
-            "/thanks — поблагодарить коллегу\n"
-            "/profile — мой профиль\n"
-            "/leave — поставить бот на паузу\n"
-            "/resume — вернуться\n"
-            "/delete_me — удалить профиль"
-        )
+        await message.answer(user_help_text(user))
         return
 
     if flow["flow_type"] == "profile_edit" and flow["step"] == "waiting_name":
@@ -5020,6 +5099,7 @@ async def main() -> None:
 
     await init_db_pool()
     await init_db()
+    await configure_bot_commands()
 
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=False)
