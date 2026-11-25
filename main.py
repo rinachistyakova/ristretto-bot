@@ -4118,6 +4118,7 @@ def admin_status_label(user: asyncpg.Record | dict) -> str:
 def admin_home_keyboard(owner: bool) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="Пользователи", callback_data="admin_users_menu")],
+        [InlineKeyboardButton(text="Сообщение всем", callback_data="admin_message_all")],
         [InlineKeyboardButton(text="Ждут активации", callback_data="admin_pending_menu")],
         [InlineKeyboardButton(text="Активность недели", callback_data="admin_week_activity")],
         [InlineKeyboardButton(text="Блокировки", callback_data="admin_blocks_menu")],
@@ -4181,6 +4182,199 @@ async def admin_home_callback(callback: CallbackQuery) -> None:
         return
     await send_admin_home(callback.message, callback.from_user.id)
     await callback.answer()
+
+
+async def get_admin_broadcast_recipients():
+    assert pool is not None
+    async with pool.acquire() as conn:
+        return await conn.fetch("""
+            SELECT user_id FROM users
+            WHERE status IN ('active', 'paused', 'pending_activation')
+              AND deleted_at IS NULL
+              AND removed_by_admin=0
+              AND delivery_available=1
+            ORDER BY user_id
+        """)
+
+
+@router.callback_query(F.data == "admin_message_all")
+async def admin_message_all_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    previous = await get_flow(callback.from_user.id)
+    if previous and previous["flow_type"] == "admin_broadcast":
+        if previous["step"] == "sending":
+            # After a restart, an interrupted run may remain marked as sending.
+            # Do not offer a retry while a recent run could still be active.
+            assert pool is not None
+            async with pool.acquire() as conn:
+                recovered = await conn.fetchrow("""
+                    UPDATE user_flows
+                    SET step='retry', updated_at=NOW()
+                    WHERE user_id=$1 AND flow_type='admin_broadcast'
+                      AND step='sending'
+                      AND updated_at < NOW() - INTERVAL '15 minutes'
+                    RETURNING cycle_key
+                """, callback.from_user.id)
+            if not recovered:
+                await callback.answer(
+                    "Рассылка выполняется. Если она прервалась, повтори через 15 минут.",
+                    show_alert=True,
+                )
+                return
+            previous = await get_flow(callback.from_user.id)
+
+        if previous["step"] == "retry":
+            key = previous["cycle_key"]
+            message_id = key.split(":")[-1]
+            assert pool is not None
+            async with pool.acquire() as conn:
+                already_sent = await conn.fetchval("""
+                    SELECT COUNT(*) FROM broadcast_deliveries
+                    WHERE job_name='admin_custom_message' AND cycle_key=$1
+                """, key)
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="Продолжить рассылку",
+                    callback_data=f"admin_message_retry:{message_id}",
+                )],
+                [InlineKeyboardButton(
+                    text="Завершить без повторной отправки",
+                    callback_data=f"admin_message_cancel:{message_id}",
+                )],
+            ])
+            await callback.message.answer(
+                "Предыдущая рассылка не завершена.\n"
+                f"Уже доставлено: {already_sent}.\n"
+                "Можно продолжить отправку тем, кто ещё не получил сообщение.",
+                reply_markup=keyboard,
+            )
+            await callback.answer()
+            return
+
+    await set_flow(callback.from_user.id, "admin_broadcast", "waiting_text")
+    await callback.message.answer(
+        "Напиши текст сообщения для всех пользователей. "
+        "Максимум 3500 символов.\n\n"
+        "Перед отправкой покажу предпросмотр."
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_message_cancel:"))
+async def admin_message_cancel_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    key = f"{callback.from_user.id}:{callback.message.chat.id}:{callback.data.split(':')[-1]}"
+    flow = await get_flow(callback.from_user.id)
+    if (
+        not flow or flow["flow_type"] != "admin_broadcast"
+        or flow["cycle_key"] != key
+        or flow["step"] not in {"confirm", "retry"}
+    ):
+        await callback.answer("Это сообщение уже неактуально.", show_alert=True)
+        return
+
+    await clear_flow(callback.from_user.id)
+    await callback.message.answer("Рассылка отменена.")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_message_confirm:"))
+@router.callback_query(F.data.startswith("admin_message_retry:"))
+async def admin_message_send_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    key = f"{callback.from_user.id}:{callback.message.chat.id}:{callback.data.split(':')[-1]}"
+    assert pool is not None
+    async with pool.acquire() as conn:
+        draft = await conn.fetchrow("""
+            UPDATE user_flows SET step='sending', updated_at=NOW()
+            WHERE user_id=$1 AND flow_type='admin_broadcast'
+              AND step IN ('confirm', 'retry') AND cycle_key=$2
+            RETURNING draft_text
+        """, callback.from_user.id, key)
+    if not draft or not draft["draft_text"]:
+        await callback.answer("Рассылка уже выполняется или отменена.", show_alert=True)
+        return
+
+    await callback.answer("Рассылка началась")
+    await callback.message.answer("Отправляю сообщения. После завершения пришлю отчёт.")
+    delivered = unavailable = errors = skipped = 0
+    job_name = "admin_custom_message"
+    try:
+        recipients = await get_admin_broadcast_recipients()
+        async with pool.acquire() as conn:
+            previous = await conn.fetch("""
+                SELECT user_id FROM broadcast_deliveries
+                WHERE job_name=$1 AND cycle_key=$2
+            """, job_name, key)
+        completed = {row["user_id"] for row in previous}
+
+        for index, recipient in enumerate(recipients, start=1):
+            # Keep the persisted run timestamp fresh during a longer broadcast.
+            if index % 25 == 0:
+                async with pool.acquire() as conn:
+                    await conn.execute("""
+                        UPDATE user_flows SET updated_at=NOW()
+                        WHERE user_id=$1 AND flow_type='admin_broadcast'
+                          AND cycle_key=$2 AND step='sending'
+                    """, callback.from_user.id, key)
+            user_id = recipient["user_id"]
+            if user_id in completed:
+                skipped += 1
+                continue
+            try:
+                await safe_send_message(user_id, draft["draft_text"])
+                await mark_broadcast_delivered(job_name, key, user_id)
+                delivered += 1
+            except TelegramForbiddenError:
+                unavailable += 1
+                await deactivate_unreachable_user(user_id)
+            except Exception:
+                errors += 1
+                logging.exception("Ошибка рассылки пользователю %s", user_id)
+        await audit_admin_action(
+            callback.from_user.id, "custom_broadcast_sent", object_type="broadcast"
+        )
+    except Exception:
+        errors += 1
+        logging.exception("Ошибка выполнения админской рассылки")
+
+    report = (
+        f"Отправлено: {delivered}\n"
+        f"Уже получали: {skipped}\n"
+        f"Недоступны: {unavailable}\n"
+        f"Ошибок: {errors}"
+    )
+    async with pool.acquire() as conn:
+        if errors:
+            await conn.execute("""
+                UPDATE user_flows SET step='retry', updated_at=NOW()
+                WHERE user_id=$1 AND flow_type='admin_broadcast'
+                  AND cycle_key=$2 AND step='sending'
+            """, callback.from_user.id, key)
+        else:
+            await conn.execute("""
+                DELETE FROM user_flows
+                WHERE user_id=$1 AND flow_type='admin_broadcast'
+                  AND cycle_key=$2 AND step='sending'
+            """, callback.from_user.id, key)
+
+    if errors:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Повторить ошибки", callback_data=f"admin_message_retry:{key.split(':')[-1]}")],
+            [InlineKeyboardButton(text="Завершить", callback_data=f"admin_message_cancel:{key.split(':')[-1]}")],
+        ])
+        await callback.message.answer(f"Рассылка завершена с ошибками.\n{report}", reply_markup=keyboard)
+    else:
+        await callback.message.answer(f"Рассылка завершена.\n{report}")
 
 
 async def get_admin_user_metrics(user_id: int, cycle_key: str) -> dict:
@@ -4875,6 +5069,38 @@ async def flow_message_handler(message: Message) -> None:
 
     text = message.text.strip()
     user = await get_user(message.from_user.id)
+
+    admin_flow = await get_flow(message.from_user.id)
+    if admin_flow and admin_flow["flow_type"] == "admin_broadcast":
+        if not is_admin(message.from_user.id):
+            await clear_flow(message.from_user.id)
+            await message.answer("Нет доступа.")
+            return
+
+        if admin_flow["step"] == "waiting_text":
+            if not 1 <= len(text) <= 3500:
+                await message.answer("Напиши сообщение длиной до 3500 символов.")
+                return
+
+            key = f"{message.from_user.id}:{message.chat.id}:{message.message_id}"
+            await set_flow(
+                message.from_user.id, "admin_broadcast", "confirm",
+                cycle_key=key, draft_text=text,
+            )
+            recipients = await get_admin_broadcast_recipients()
+            await message.answer(
+                f"Предпросмотр рассылки\nПолучателей: {len(recipients)}\n\n"
+                f"{text}\n\nОтправить это сообщение?",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="Отправить всем", callback_data=f"admin_message_confirm:{message.message_id}")],
+                    [InlineKeyboardButton(text="Отмена", callback_data=f"admin_message_cancel:{message.message_id}")],
+                ]),
+            )
+            return
+
+        if admin_flow["step"] in {"confirm", "sending", "retry"}:
+            await message.answer("Используй кнопки для управления рассылкой.")
+            return
 
     # Новый онбординг и одноразовая миграция профиля хранят текущий шаг в users,
     # поэтому переживают рестарт бота без потери прогресса.
