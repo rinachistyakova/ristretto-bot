@@ -1224,6 +1224,7 @@ def pending_activation_keyboard(user_id: int) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="Активировать", callback_data=f"admin_activate:{user_id}")],
             [InlineKeyboardButton(text="Не активировать", callback_data=f"admin_deny_activation:{user_id}")],
+            [InlineKeyboardButton(text="Вернуть на доработку", callback_data=f"admin_profile_revision:{user_id}")],
         ]
     )
 
@@ -1378,6 +1379,9 @@ async def finish_profile_after_responsibility(message: Message, user_id: int, te
 
     await set_responsibility_text(user_id, text)
     await complete_profile_setup(user_id)
+    revision = await get_flow(user_id)
+    if revision and revision["flow_type"] == "profile_revision_target":
+        await clear_flow(user_id)
     user = await get_user(user_id)
 
     if not user:
@@ -1505,6 +1509,17 @@ async def profile_team_callback(callback: CallbackQuery) -> None:
         return
 
     await set_profile_team(callback.from_user.id, team)
+    revision = await get_flow(callback.from_user.id)
+    if (
+        revision and revision["flow_type"] == "profile_revision_target"
+        and revision["cycle_key"] == "team"
+    ):
+        await complete_profile_setup(callback.from_user.id)
+        await clear_flow(callback.from_user.id)
+        await callback.message.answer("Команда исправлена. Профиль снова отправлен на проверку.")
+        await notify_owner_pending_activation(callback.from_user.id)
+        await callback.answer()
+        return
     await set_onboarding_step(callback.from_user.id, "responsibility")
     user = await get_user(callback.from_user.id)
     await send_profile_step(callback.message, user)
@@ -4118,6 +4133,7 @@ def admin_status_label(user: asyncpg.Record | dict) -> str:
 def admin_home_keyboard(owner: bool) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="Пользователи", callback_data="admin_users_menu")],
+        [InlineKeyboardButton(text="Карточки сотрудников", callback_data="admin_profiles_menu")],
         [InlineKeyboardButton(text="Сообщение всем", callback_data="admin_message_all")],
         [InlineKeyboardButton(text="Ждут активации", callback_data="admin_pending_menu")],
         [InlineKeyboardButton(text="Активность недели", callback_data="admin_week_activity")],
@@ -4377,6 +4393,498 @@ async def admin_message_send_callback(callback: CallbackQuery) -> None:
         await callback.message.answer(f"Рассылка завершена.\n{report}")
 
 
+# Карточки: отдельные состояния, без смешивания с ожиданием активации.
+async def get_admin_profile_counts() -> tuple[int, int, int]:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        unfinished = await conn.fetchval("""
+            SELECT COUNT(*) FROM users
+            WHERE status='pending_activation'
+              AND onboarding_step IS DISTINCT FROM 'completed'
+              AND deleted_at IS NULL AND removed_by_admin=0
+        """)
+        awaiting = await conn.fetchval("""
+            SELECT COUNT(*) FROM users
+            WHERE status='pending_activation'
+              AND onboarding_step='completed'
+              AND profile_migration_required=0
+              AND deleted_at IS NULL AND removed_by_admin=0
+        """)
+        migration = await conn.fetchval("""
+            SELECT COUNT(*) FROM users
+            WHERE status='active' AND active=1
+              AND profile_migration_required=1
+              AND deleted_at IS NULL AND removed_by_admin=0
+        """)
+    return int(unfinished), int(awaiting), int(migration)
+
+
+@router.callback_query(F.data == "admin_profiles_menu")
+async def admin_profiles_menu_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    unfinished, awaiting, migration = await get_admin_profile_counts()
+    await callback.message.answer(
+        "Карточки сотрудников\n\n"
+        f"Не закончили регистрацию: {unfinished}\n"
+        f"Ждут активации: {awaiting}\n"
+        f"Нужно дополнить старый профиль: {migration}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"Не закончили регистрацию ({unfinished})",
+                callback_data="admin_profiles_incomplete:0",
+            )],
+            [InlineKeyboardButton(
+                text=f"Ждут активации ({awaiting})",
+                callback_data="admin_pending_menu",
+            )],
+            [InlineKeyboardButton(
+                text=f"Нужно дополнить старый профиль ({migration})",
+                callback_data="admin_profiles_migration:0",
+            )],
+            [InlineKeyboardButton(
+                text="Запросить заполнение профилей",
+                callback_data="admin_profiles_request",
+            )],
+            [InlineKeyboardButton(text="Назад", callback_data="admin_home")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_profiles_migration:"))
+async def admin_profiles_migration_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        page = int(callback.data.rsplit(":", 1)[1])
+        if page < 0:
+            raise ValueError
+    except ValueError:
+        await callback.answer("Некорректная страница.", show_alert=True)
+        return
+
+    page_size = 15
+    assert pool is not None
+    async with pool.acquire() as conn:
+        total = await conn.fetchval("""
+            SELECT COUNT(*) FROM users
+            WHERE status='active' AND active=1
+              AND profile_migration_required=1
+              AND deleted_at IS NULL AND removed_by_admin=0
+        """)
+        users = await conn.fetch("""
+            SELECT user_id, display_name, first_name FROM users
+            WHERE status='active' AND active=1
+              AND profile_migration_required=1
+              AND deleted_at IS NULL AND removed_by_admin=0
+            ORDER BY LOWER(COALESCE(display_name, first_name, '')), user_id
+            LIMIT $1 OFFSET $2
+        """, page_size, page * page_size)
+
+    buttons = [
+        [InlineKeyboardButton(
+            text=clean_name(u["display_name"] or u["first_name"])[:52],
+            callback_data=f"admin_user:{u['user_id']}",
+        )]
+        for u in users
+    ]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            text="Назад", callback_data=f"admin_profiles_migration:{page-1}"
+        ))
+    if (page + 1) * page_size < total:
+        nav.append(InlineKeyboardButton(
+            text="Дальше", callback_data=f"admin_profiles_migration:{page+1}"
+        ))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton(
+        text="К карточкам", callback_data="admin_profiles_menu"
+    )])
+    await callback.message.answer(
+        f"Нужно дополнить старый профиль: {total}\n"
+        f"Страница {page+1} из {max(1, (total + page_size - 1)//page_size)}.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_profiles_request")
+async def admin_profiles_request_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    migration, unfinished = await get_profile_request_counts()
+    token = datetime.now(TZ).strftime("%Y%m%d%H%M%S%f")
+    await set_flow(
+        callback.from_user.id, "admin_profile_request", "confirm", cycle_key=token,
+    )
+    await callback.message.answer(
+        "Отправить напоминания о заполнении профилей?\n\n"
+        f"Дополнить старый профиль: {migration}\n"
+        f"Завершить регистрацию: {unfinished}\n\n"
+        "Повторные запросы уже уведомлённым сотрудникам ограничены.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="Отправить запросы",
+                callback_data=f"admin_profiles_request_confirm:{token}",
+            )],
+            [InlineKeyboardButton(
+                text="Отмена",
+                callback_data=f"admin_profiles_request_cancel:{token}",
+            )],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_profiles_request_cancel:"))
+async def admin_profiles_request_cancel_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    token = callback.data.rsplit(":", 1)[1]
+    assert pool is not None
+    async with pool.acquire() as conn:
+        removed = await conn.fetchval("""
+            DELETE FROM user_flows
+            WHERE user_id=$1 AND flow_type='admin_profile_request'
+              AND step='confirm' AND cycle_key=$2
+            RETURNING user_id
+        """, callback.from_user.id, token)
+    if not removed:
+        await callback.answer("Этот запрос уже неактуален.", show_alert=True)
+        return
+    await callback.message.answer("Отправка напоминаний отменена.")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_profiles_request_confirm:"))
+async def admin_profiles_request_confirm_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    token = callback.data.rsplit(":", 1)[1]
+    assert pool is not None
+    async with pool.acquire() as conn:
+        claimed = await conn.fetchval("""
+            UPDATE user_flows SET step='sending', updated_at=NOW()
+            WHERE user_id=$1 AND flow_type='admin_profile_request'
+              AND step='confirm' AND cycle_key=$2
+            RETURNING user_id
+        """, callback.from_user.id, token)
+    if not claimed:
+        await callback.answer("Запрос уже отправляется или отменён.", show_alert=True)
+        return
+    await callback.answer("Отправляю напоминания")
+    try:
+        migrated = await send_profile_migration_requests()
+        unfinished = await send_pending_profile_requests()
+        await audit_admin_action(callback.from_user.id, "profile_reminders_sent")
+        await callback.message.answer(
+            "Напоминания отправлены.\n"
+            f"Дополнить старые профили: {migrated}\n"
+            f"Завершить регистрацию: {unfinished}"
+        )
+    except Exception:
+        logging.exception("Не удалось завершить рассылку напоминаний о профиле")
+        await callback.message.answer(
+            "Ошибка при отправке напоминаний. Повтори запрос позднее; "
+            "успешные доставки записаны и не будут продублированы в этом цикле."
+        )
+    finally:
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                DELETE FROM user_flows
+                WHERE user_id=$1 AND flow_type='admin_profile_request'
+                  AND cycle_key=$2 AND step='sending'
+            """, callback.from_user.id, token)
+
+
+@router.callback_query(F.data.startswith("admin_profiles_incomplete:"))
+async def admin_profiles_incomplete_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        page = int(callback.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректная страница.", show_alert=True)
+        return
+    if page < 0:
+        await callback.answer("Некорректная страница.", show_alert=True)
+        return
+
+    page_size = 15
+    assert pool is not None
+    async with pool.acquire() as conn:
+        total = await conn.fetchval("""
+            SELECT COUNT(*) FROM users
+            WHERE status='pending_activation'
+              AND onboarding_step IS DISTINCT FROM 'completed'
+              AND deleted_at IS NULL AND removed_by_admin=0
+        """)
+        users = await conn.fetch("""
+            SELECT user_id, display_name, first_name FROM users
+            WHERE status='pending_activation'
+              AND onboarding_step IS DISTINCT FROM 'completed'
+              AND deleted_at IS NULL AND removed_by_admin=0
+            ORDER BY created_at, user_id
+            LIMIT $1 OFFSET $2
+        """, page_size, page * page_size)
+
+    rows = []
+    for user in users:
+        name = clean_name(user["display_name"] or user["first_name"] or str(user["user_id"]))
+        rows.append([InlineKeyboardButton(
+            text=name[:52], callback_data=f"admin_user:{user['user_id']}"
+        )])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            text="Назад", callback_data=f"admin_profiles_incomplete:{page-1}"
+        ))
+    if (page + 1) * page_size < total:
+        nav.append(InlineKeyboardButton(
+            text="Дальше", callback_data=f"admin_profiles_incomplete:{page+1}"
+        ))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="К карточкам", callback_data="admin_profiles_menu")])
+    await callback.message.answer(
+        f"Не закончили регистрацию: {total}\n"
+        f"Страница {page+1} из {max(1, (total + page_size - 1) // page_size)}.\n"
+        "Нажми на сотрудника, чтобы открыть карточку.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+# Изменение данных сотрудника администратором. Статус доступа не меняется.
+@router.callback_query(F.data.startswith("admin_profile_edit:"))
+async def admin_profile_edit_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        target_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная карточка.", show_alert=True)
+        return
+    target = await get_user(target_id)
+    if not target or target["status"] == "self_deleted" or target["deleted_at"] is not None:
+        await callback.answer("Карточка недоступна.", show_alert=True)
+        return
+
+    await callback.message.answer(
+        f"Редактирование: {clean_name(target['display_name'])}\n"
+        "Выбери поле:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Имя и фамилия", callback_data=f"admin_profile_field:{target_id}:name")],
+            [InlineKeyboardButton(text="Команда", callback_data=f"admin_profile_field:{target_id}:team")],
+            [InlineKeyboardButton(text="За что отвечает", callback_data=f"admin_profile_field:{target_id}:responsibility")],
+            [InlineKeyboardButton(text="Вернуться к карточке", callback_data=f"admin_user:{target_id}")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_profile_field:"))
+async def admin_profile_field_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        _, target_str, field = callback.data.split(":", 2)
+        target_id = int(target_str)
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный запрос.", show_alert=True)
+        return
+    if field not in {"name", "team", "responsibility"}:
+        await callback.answer("Неизвестное поле.", show_alert=True)
+        return
+    target = await get_user(target_id)
+    if not target or target["status"] == "self_deleted" or target["deleted_at"] is not None:
+        await callback.answer("Карточка недоступна.", show_alert=True)
+        return
+
+    await set_flow(callback.from_user.id, "admin_profile_edit", f"waiting_{field}", recipient_id=target_id)
+    cancel = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Отмена", callback_data=f"admin_profile_cancel:{target_id}")]
+    ])
+    if field == "team":
+        rows = [
+            [InlineKeyboardButton(
+                text=label or "Другая команда",
+                callback_data=f"admin_profile_team:{target_id}:{team}",
+            )]
+            for team, label in TEAM_LABELS.items()
+        ]
+        rows.extend(cancel.inline_keyboard)
+        await callback.message.answer(
+            "Выбери команду сотрудника:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+    else:
+        prompt = (
+            "Введи новое имя и фамилию сотрудника (2–80 символов)."
+            if field == "name"
+            else "Введи, за что отвечает сотрудник (3–150 символов)."
+        )
+        await callback.message.answer(prompt, reply_markup=cancel)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_profile_team:"))
+async def admin_profile_team_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        _, target_str, team = callback.data.split(":", 2)
+        target_id = int(target_str)
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный запрос.", show_alert=True)
+        return
+    flow = await get_flow(callback.from_user.id)
+    if (
+        team not in TEAM_LABELS or not flow
+        or flow["flow_type"] != "admin_profile_edit"
+        or flow["step"] != "waiting_team"
+        or flow["recipient_id"] != target_id
+    ):
+        await callback.answer("Этот выбор уже неактуален.", show_alert=True)
+        return
+    target = await get_user(target_id)
+    if not target or target["status"] == "self_deleted" or target["deleted_at"] is not None:
+        await clear_flow(callback.from_user.id)
+        await callback.answer("Карточка недоступна.", show_alert=True)
+        return
+    await set_profile_team(target_id, team)
+    await audit_admin_action(callback.from_user.id, "admin_edit_team", target_user_id=target_id, object_type="user", object_id=target_id)
+    await clear_flow(callback.from_user.id)
+    await callback.message.answer("Команда обновлена.")
+    await send_admin_user_card(callback.message, target_id, callback.from_user.id)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_profile_cancel:"))
+async def admin_profile_cancel_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        target_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный запрос.", show_alert=True)
+        return
+    flow = await get_flow(callback.from_user.id)
+    if not flow or flow["flow_type"] != "admin_profile_edit" or flow["recipient_id"] != target_id:
+        await callback.answer("Диалог уже завершён.", show_alert=True)
+        return
+    await clear_flow(callback.from_user.id)
+    await callback.message.answer("Редактирование отменено.")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_profile_revision:"))
+async def admin_profile_revision_start_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        target_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная карточка.", show_alert=True)
+        return
+    target = await get_user(target_id)
+    if (
+        not target or target["status"] != "pending_activation"
+        or target["onboarding_step"] != "completed"
+        or target["deleted_at"] is not None
+        or target["removed_by_admin"] == 1
+    ):
+        await callback.answer("Карточка уже не ожидает активации.", show_alert=True)
+        return
+
+    await callback.message.answer(
+        f"Вернуть на доработку: {clean_name(target['display_name'])}\n"
+        "Какое поле сотруднику нужно исправить?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Имя", callback_data=f"admin_profile_revision_field:{target_id}:name")],
+            [InlineKeyboardButton(text="Команда", callback_data=f"admin_profile_revision_field:{target_id}:team")],
+            [InlineKeyboardButton(text="Обязанности", callback_data=f"admin_profile_revision_field:{target_id}:responsibility")],
+            [InlineKeyboardButton(text="Отмена", callback_data="admin_profiles_menu")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_profile_revision_field:"))
+async def admin_profile_revision_field_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        target_str, field = callback.data.removeprefix("admin_profile_revision_field:").split(":", 1)
+        target_id = int(target_str)
+    except ValueError:
+        await callback.answer("Некорректный запрос.", show_alert=True)
+        return
+    if field not in {"name", "team", "responsibility"}:
+        await callback.answer("Неизвестное поле.", show_alert=True)
+        return
+    target = await get_user(target_id)
+    if (
+        not target or target["status"] != "pending_activation"
+        or target["onboarding_step"] != "completed"
+        or target["deleted_at"] is not None
+        or target["removed_by_admin"] == 1
+    ):
+        await callback.answer("Карточка уже не ожидает активации.", show_alert=True)
+        return
+
+    await set_flow(
+        callback.from_user.id, "admin_profile_revision", "waiting_reason",
+        cycle_key=field, recipient_id=target_id,
+    )
+    await callback.message.answer(
+        "Напиши причину возврата: что именно нужно исправить? "
+        "От 5 до 400 символов.\n\n"
+        "Сообщение будет отправлено сотруднику только после ввода причины.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Отмена", callback_data=f"admin_profile_revision_cancel:{target_id}")]
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_profile_revision_cancel:"))
+async def admin_profile_revision_cancel_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        target_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный запрос.", show_alert=True)
+        return
+    flow = await get_flow(callback.from_user.id)
+    if (
+        not flow or flow["flow_type"] != "admin_profile_revision"
+        or flow["recipient_id"] != target_id
+    ):
+        await callback.answer("Диалог уже завершён.", show_alert=True)
+        return
+    await clear_flow(callback.from_user.id)
+    await callback.message.answer("Возврат на доработку отменён.")
+    await callback.answer()
+
+
 async def get_admin_user_metrics(user_id: int, cycle_key: str) -> dict:
     assert pool is not None
     async with pool.acquire() as conn:
@@ -4423,6 +4931,21 @@ async def send_admin_user_card(message: Message, user_id: int, viewer_id: int) -
         buttons.append([InlineKeyboardButton(text="Вернуть доступ", callback_data=f"admin_restore:{user_id}")])
     elif user_id != ADMIN_ID and user["status"] not in {"self_deleted"}:
         buttons.append([InlineKeyboardButton(text="Закрыть доступ", callback_data=f"admin_remove:{user_id}")])
+
+    if (
+        user["status"] == "pending_activation"
+        and user["onboarding_step"] == "completed"
+        and user["deleted_at"] is None
+    ):
+        buttons.append([InlineKeyboardButton(
+            text="Вернуть на доработку",
+            callback_data=f"admin_profile_revision:{user_id}",
+        )])
+
+    if user["status"] != "self_deleted" and user["deleted_at"] is None:
+        buttons.append([InlineKeyboardButton(
+            text="Редактировать карточку", callback_data=f"admin_profile_edit:{user_id}"
+        )])
 
     if is_owner(viewer_id) and user_id != ADMIN_ID and user["status"] == "active" and user["active"] == 1:
         if user["role"] == "admin":
@@ -5028,13 +5551,88 @@ async def send_profile_migration_requests() -> int:
     return sent
 
 
+async def get_profile_request_counts() -> tuple[int, int]:
+    """Number of previously unnotified eligible old and unfinished profiles."""
+    assert pool is not None
+    week = current_cycle()
+    async with pool.acquire() as conn:
+        old = await conn.fetchval("""
+            SELECT COUNT(*) FROM users u
+            WHERE u.status='active' AND u.active=1
+              AND u.profile_migration_required=1
+              AND u.deleted_at IS NULL AND u.removed_by_admin=0
+              AND u.delivery_available=1
+              AND NOT EXISTS (
+                  SELECT 1 FROM broadcast_deliveries d
+                  WHERE d.user_id=u.user_id
+                    AND d.job_name='profile_migration_v2' AND d.cycle_key='v2'
+              )
+        """)
+        unfinished = await conn.fetchval("""
+            SELECT COUNT(*) FROM users u
+            WHERE u.status='pending_activation'
+              AND u.onboarding_step IS DISTINCT FROM 'completed'
+              AND u.deleted_at IS NULL AND u.removed_by_admin=0
+              AND u.delivery_available=1
+              AND NOT EXISTS (
+                  SELECT 1 FROM broadcast_deliveries d
+                  WHERE d.user_id=u.user_id
+                    AND d.job_name='profile_completion_v3' AND d.cycle_key=$1
+              )
+        """, week)
+    return int(old), int(unfinished)
+
+
+async def send_pending_profile_requests() -> int:
+    """Send at most one reminder per user per week for unfinished registration."""
+    assert pool is not None
+    job_name = "profile_completion_v3"
+    cycle_key = current_cycle()
+    async with pool.acquire() as conn:
+        users = await conn.fetch("""
+            SELECT u.user_id FROM users u
+            WHERE u.status='pending_activation'
+              AND u.onboarding_step IS DISTINCT FROM 'completed'
+              AND u.deleted_at IS NULL AND u.removed_by_admin=0
+              AND u.delivery_available=1
+              AND NOT EXISTS (
+                  SELECT 1 FROM broadcast_deliveries d
+                  WHERE d.user_id=u.user_id
+                    AND d.job_name=$1 AND d.cycle_key=$2
+              )
+            ORDER BY u.user_id
+        """, job_name, cycle_key)
+
+    sent = 0
+    for user in users:
+        user_id = user["user_id"]
+        try:
+            await safe_send_message(
+                user_id,
+                "Ты ещё не закончил(а) регистрацию в Random Ristretto.\n\n"
+                "Отправь /start — продолжим заполнение профиля с того шага, "
+                "на котором ты остановился(ась).",
+            )
+            await mark_broadcast_delivered(job_name, cycle_key, user_id)
+            sent += 1
+        except TelegramForbiddenError:
+            await deactivate_unreachable_user(user_id)
+        except Exception:
+            logging.exception("Не удалось напомнить о регистрации пользователю %s", user_id)
+    return sent
+
+
 @router.message(Command("request_profiles_now"))
 async def request_profiles_now_command(message: Message) -> None:
     if not await require_admin(message):
         return
 
-    sent = await send_profile_migration_requests()
-    await message.answer(f"Запрос обновить профиль отправлен: {sent} пользователям.")
+    migrated = await send_profile_migration_requests()
+    unfinished = await send_pending_profile_requests()
+    await message.answer(
+        f"Запросы отправлены: дополнить профиль — {migrated}, "
+        f"завершить регистрацию — {unfinished}."
+    )
 
 
 @router.message(Command("request_names_now"))
@@ -5043,8 +5641,12 @@ async def request_names_now_command(message: Message) -> None:
     if not await require_admin(message):
         return
 
-    sent = await send_profile_migration_requests()
-    await message.answer(f"Запрос обновить профиль отправлен: {sent} пользователям.")
+    migrated = await send_profile_migration_requests()
+    unfinished = await send_pending_profile_requests()
+    await message.answer(
+        f"Запросы отправлены: дополнить профиль — {migrated}, "
+        f"завершить регистрацию — {unfinished}."
+    )
 
 
 @router.message(Command("thanks_reminder_now"))
@@ -5102,6 +5704,109 @@ async def flow_message_handler(message: Message) -> None:
             await message.answer("Используй кнопки для управления рассылкой.")
             return
 
+    if admin_flow and admin_flow["flow_type"] == "admin_profile_revision":
+        if not is_admin(message.from_user.id):
+            await clear_flow(message.from_user.id)
+            await message.answer("Нет доступа.")
+            return
+        if admin_flow["step"] != "waiting_reason":
+            await clear_flow(message.from_user.id)
+            await message.answer("Диалог сброшен.")
+            return
+        if not 5 <= len(text) <= 400:
+            await message.answer("Причина должна содержать от 5 до 400 символов.")
+            return
+        field = admin_flow["cycle_key"]
+        target_id = admin_flow["recipient_id"]
+        field_names = {"name": "имя", "team": "команду", "responsibility": "описание обязанностей"}
+        if field not in field_names or not target_id:
+            await clear_flow(message.from_user.id)
+            await message.answer("Некорректный запрос. Начни заново.")
+            return
+
+        assert pool is not None
+        async with pool.acquire() as conn:
+            changed = await conn.fetchval("""
+                UPDATE users
+                SET onboarding_step=$2,
+                    name_confirmed=CASE WHEN $2='name' THEN 0 ELSE name_confirmed END,
+                    updated_at=NOW()
+                WHERE user_id=$1 AND status='pending_activation'
+                  AND onboarding_step='completed'
+                  AND deleted_at IS NULL AND removed_by_admin=0
+                RETURNING user_id
+            """, target_id, field)
+        if not changed:
+            await clear_flow(message.from_user.id)
+            await message.answer("Карточка уже изменилась. Возврат не выполнен.")
+            return
+
+        await audit_admin_action(
+            message.from_user.id, "profile_returned_for_revision",
+            target_user_id=target_id, object_type="user", object_id=target_id,
+        )
+        # Помним, какое именно поле нужно исправить. Остальные не переспрашиваем.
+        await set_flow(
+            target_id, "profile_revision_target", "waiting_corrected", cycle_key=field,
+        )
+        await clear_flow(message.from_user.id)
+        try:
+            await safe_send_message(
+                target_id,
+                "Администратор вернул твой профиль на доработку.\n\n"
+                f"Нужно исправить: {field_names[field]}.\n"
+                f"Комментарий: {text}\n\n"
+                "Отправь /start, чтобы продолжить с нужного шага. "
+                "После исправления профиль снова попадёт на активацию.",
+            )
+            await message.answer("Карточка отправлена на доработку. Сотрудник уведомлён.")
+        except TelegramForbiddenError:
+            await deactivate_unreachable_user(target_id)
+            await message.answer(
+                "Карточка возвращена на доработку, но сотрудник заблокировал бота. "
+                "Он сможет продолжить после /start."
+            )
+        except Exception:
+            logging.exception("Не удалось сообщить сотруднику %s о доработке", target_id)
+            await message.answer(
+                "Карточка возвращена на доработку, но уведомление не доставлено. "
+                "Попроси сотрудника открыть /start."
+            )
+        return
+
+    # Администратор редактирует карточку другого пользователя, не собственный профиль.
+    if admin_flow and admin_flow["flow_type"] == "admin_profile_edit":
+        if not is_admin(message.from_user.id):
+            await clear_flow(message.from_user.id)
+            await message.answer("Нет доступа.")
+            return
+        target_id = admin_flow["recipient_id"]
+        target = await get_user(target_id) if target_id else None
+        if not target or target["status"] == "self_deleted" or target["deleted_at"] is not None:
+            await clear_flow(message.from_user.id)
+            await message.answer("Карточка больше недоступна.")
+            return
+        if admin_flow["step"] == "waiting_name":
+            if not 2 <= len(text) <= 80 or "\n" in text:
+                await message.answer("Имя должно содержать 2–80 символов, без переноса строк.")
+                return
+            await set_display_name(target_id, text)
+            action = "admin_edit_name"
+        elif admin_flow["step"] == "waiting_responsibility":
+            if not 3 <= len(text) <= 150:
+                await message.answer("Описание должно содержать 3–150 символов.")
+                return
+            await set_responsibility_text(target_id, text)
+            action = "admin_edit_responsibility"
+        else:
+            await message.answer("Выбери команду кнопкой или отмени редактирование.")
+            return
+        await audit_admin_action(message.from_user.id, action, target_user_id=target_id, object_type="user", object_id=target_id)
+        await clear_flow(message.from_user.id)
+        await message.answer("Данные сотрудника обновлены.")
+        await send_admin_user_card(message, target_id, message.from_user.id)
+        return
+
     # Новый онбординг и одноразовая миграция профиля хранят текущий шаг в users,
     # поэтому переживают рестарт бота без потери прогресса.
     if user and (
@@ -5118,6 +5823,16 @@ async def flow_message_handler(message: Message) -> None:
                 return
 
             await set_display_name(message.from_user.id, text)
+            revision = await get_flow(message.from_user.id)
+            if (
+                revision and revision["flow_type"] == "profile_revision_target"
+                and revision["cycle_key"] == "name"
+            ):
+                await complete_profile_setup(message.from_user.id)
+                await clear_flow(message.from_user.id)
+                await message.answer("Имя исправлено. Профиль снова отправлен на проверку.")
+                await notify_owner_pending_activation(message.from_user.id)
+                return
             await set_onboarding_step(message.from_user.id, "team")
             user = await get_user(message.from_user.id)
             await send_profile_step(message, user)
