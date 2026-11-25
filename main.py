@@ -84,6 +84,34 @@ ICEBREAKERS = [
     "Какой маленький ритуал помогает тебе работать?",
 ]
 
+# Initial org structure approved for configuration (team names remain editable).
+ORG_TEAM_SEEDS = [
+    ('product', 'product:1', 'Продуктовые стратегии и инициативы', 'Дмитрий Русов', None),
+    ('product', 'product:2', 'Развитие контент-продуктов', 'Дмитрий Русов', None),
+    ('product', 'product:3', 'Продуктовые менеджеры', 'Дмитрий Русов', None),
+    ('analytics', 'analytics:4', 'Продуктовая аналитика рекламных технологий', 'Максим Калацкий', None),
+    ('analytics', 'analytics:5', 'Команда продуктовой аналитики', 'Максим Калацкий', None),
+    ('analytics', 'analytics:6', 'Инженерия данных', 'Максим Калацкий', None),
+    ('business_development', 'business_development:7', 'Развитие и монетизация данных и аналитики', 'Михаил Тарасов', None),
+    ('business_development', 'business_development:8', 'Проектный менеджмент в области рекламы', 'Михаил Тарасов', None),
+    ('business_development', 'business_development:9', 'Развитие бизнеса Медиа', 'Михаил Тарасов', None),
+    ('business_development', 'business_development:10', 'Развитие и продажи рекламных продуктов «Гастроном медиа»', 'Михаил Тарасов', None),
+    ('business_development', 'business_development:11', 'Программа проектов', 'Михаил Тарасов', None),
+    ('development', 'development:12', 'Разработка медийной рекламы', 'Глеб Буров', None),
+    ('development', 'development:13', 'Разработка продуктов закрепления и буста', 'Глеб Буров', None),
+    ('development', 'development:14', 'Разработка рекламной платформы', 'Глеб Буров', None),
+    ('development', 'development:15', 'Развитие медиаконтента', 'Глеб Буров', None),
+    ('development', 'development:16', 'Разработка инструментов повышения эффективности монетизации', 'Глеб Буров', None),
+    ('development', 'development:17', 'Разработка аффилиатной платформы', 'Глеб Буров', None),
+    ('development', 'development:18', 'Интеллектуальная автоматизация', 'Глеб Буров', None),
+    ('commerce', 'commerce:19', 'Маркетинг и продвижение рекламных продуктов', 'Денис Ардаширов', None),
+    ('commerce', 'commerce:20', 'Продажи', 'Денис Ардаширов', None),
+    ('commerce', 'commerce:21', 'Операционная эффективность', 'Денис Ардаширов', None),
+    ('commerce', 'commerce:22', 'Эффективность продаж и партнёрств', 'Денис Ардаширов', None),
+    ('strategic_initiatives', 'strategic_initiatives:23', 'Социальная коммерция', None, 'Татьяна Аксенова'),
+]
+
+
 # =========================================================
 # ОБЩИЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # =========================================================
@@ -194,12 +222,28 @@ def clean_name(value: str | None) -> str:
     return value if value else "Коллега"
 
 
-TEAM_LABELS = {
+# Older values stay readable for existing profiles until the migration is complete.
+LEGACY_TEAM_LABELS = {
     "sales": "Продажи",
     "operations": "Операции",
     "marketing": "Маркетинг",
     "other": "",
 }
+
+# All users have the same three-step onboarding. External colleagues participate normally.
+REGISTRATION_TEAM_LABELS = {
+    "product": "Продукт",
+    "analytics": "Аналитика",
+    "business_development": "Биздев",
+    "development": "Разработка",
+    "commerce": "Коммерция",
+    "strategic_initiatives": "Стратегические инициативы",
+    "hr": "HR",
+    "finance": "Финансы",
+    "external": "Другая вертикаль",
+}
+TEAM_LABELS = {**LEGACY_TEAM_LABELS, **REGISTRATION_TEAM_LABELS}
+
 
 
 def team_label(team: str | None) -> str:
@@ -431,6 +475,29 @@ async def init_db() -> None:
             ON group_thanks(cycle_key, status)
         """)
 
+        # v3 editable department/team directory. NULL assignment is allowed.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS org_teams (
+                id BIGSERIAL PRIMARY KEY,
+                department_key TEXT NOT NULL,
+                seed_key TEXT UNIQUE,
+                name TEXT NOT NULL,
+                department_leader TEXT,
+                team_leader TEXT,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CHECK (length(trim(name)) > 0)
+            )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_org_teams_department ON org_teams(department_key, is_active)")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS org_team_id BIGINT REFERENCES org_teams(id) ON DELETE SET NULL")
+        await conn.executemany("""
+            INSERT INTO org_teams (department_key, seed_key, name, department_leader, team_leader)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (seed_key) DO NOTHING
+        """, ORG_TEAM_SEEDS)
+
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_active ON users(active)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_confirmed_cycle ON users(confirmed_cycle)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_match_groups_cycle ON match_groups(cycle_key)")
@@ -574,9 +641,22 @@ async def set_profile_team(user_id: int, team: str) -> None:
     async with pool.acquire() as conn:
         await conn.execute("""
             UPDATE users
-            SET team=$1, updated_at=NOW()
+            SET team=$1,
+                org_team_id=CASE WHEN team IS DISTINCT FROM $1 THEN NULL ELSE org_team_id END,
+                updated_at=NOW()
             WHERE user_id=$2 AND deleted_at IS NULL
         """, team, user_id)
+
+
+async def get_active_org_teams(department_key: str):
+    assert pool is not None
+    async with pool.acquire() as conn:
+        return await conn.fetch("""
+            SELECT id, name
+            FROM org_teams
+            WHERE department_key=$1 AND is_active=TRUE
+            ORDER BY LOWER(name), id
+        """, department_key)
 
 
 async def set_responsibility_text(user_id: int, responsibility_text: str) -> None:
@@ -1220,27 +1300,27 @@ def profile_name_confirm_keyboard() -> InlineKeyboardMarkup:
 
 def profile_team_keyboard(mode: str = "onboarding") -> InlineKeyboardMarkup:
     prefix = "profile_team_edit" if mode == "edit" else "profile_team"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Продажи", callback_data=f"{prefix}:sales")],
-            [InlineKeyboardButton(text="Операции", callback_data=f"{prefix}:operations")],
-            [InlineKeyboardButton(text="Маркетинг", callback_data=f"{prefix}:marketing")],
-            [InlineKeyboardButton(
-                text="Не отношусь ни к одной из этих команд",
-                callback_data=f"{prefix}:other",
-            )],
-        ]
-    )
+    rows = [
+        [InlineKeyboardButton(text=label, callback_data=f"{prefix}:{team}")]
+        for team, label in REGISTRATION_TEAM_LABELS.items()
+        if team != "external"
+    ]
+    rows.append([InlineKeyboardButton(
+        text="Мне только посмотреть — я из другой вертикали, но очень интересно",
+        callback_data=f"{prefix}:external",
+    )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def profile_actions_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Изменить имя", callback_data="profile_edit_name")],
-            [InlineKeyboardButton(text="Изменить команду", callback_data="profile_edit_team")],
-            [InlineKeyboardButton(text="Изменить описание", callback_data="profile_edit_responsibility")],
-        ]
-    )
+def profile_actions_keyboard(show_org_teams: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="Изменить имя", callback_data="profile_edit_name")],
+        [InlineKeyboardButton(text="Изменить департамент", callback_data="profile_edit_team")],
+        [InlineKeyboardButton(text="Изменить описание", callback_data="profile_edit_responsibility")],
+    ]
+    if show_org_teams:
+        rows.append([InlineKeyboardButton(text="Выбрать команду", callback_data="profile_org_team_choose")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def pending_activation_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -1299,7 +1379,7 @@ async def send_profile_step(message: Message, user: asyncpg.Record) -> None:
     if step == "team":
         await message.answer(
             "Шаг 2 из 3:\n"
-            "В какой ты команде?",
+            "В каком ты департаменте?",
             reply_markup=profile_team_keyboard(),
         )
         return
@@ -1323,13 +1403,17 @@ async def send_profile_step(message: Message, user: asyncpg.Record) -> None:
 async def show_profile(message: Message, user: asyncpg.Record) -> None:
     username = f"@{user['username']}" if user["username"] else "Telegram username не указан"
     responsibility = (user["responsibility_text"] or "").strip() or "не заполнено"
+    teams = await get_active_org_teams(user["team"] or "")
+    selected = next((row["name"] for row in teams if row["id"] == user["org_team_id"]), None)
+    team_line = f"Команда: {selected or 'не выбрана'}\n" if teams else ""
 
     await message.answer(
         "Твой профиль\n\n"
         f"{profile_title(user)}\n"
+        f"{team_line}"
         f"Отвечает за: {responsibility}\n"
         f"{username}",
-        reply_markup=profile_actions_keyboard(),
+        reply_markup=profile_actions_keyboard(show_org_teams=bool(teams)),
     )
 
 
@@ -1344,7 +1428,7 @@ async def notify_owner_pending_activation(user_id: int) -> None:
     text = (
         "Новый профиль ждёт активации\n\n"
         f"{clean_name(user['display_name'])}\n"
-        f"Команда: {team}\n"
+        f"Департамент: {team}\n"
         f"Отвечает за: {(user['responsibility_text'] or '').strip()}\n"
         f"Telegram: {username}"
     )
@@ -1516,7 +1600,7 @@ async def profile_change_name_callback(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("profile_team:"))
 async def profile_team_callback(callback: CallbackQuery) -> None:
     team = callback.data.split(":", 1)[1]
-    if team not in TEAM_LABELS:
+    if team not in REGISTRATION_TEAM_LABELS:
         await callback.answer("Неизвестная команда.", show_alert=True)
         return
 
@@ -1540,7 +1624,7 @@ async def profile_team_callback(callback: CallbackQuery) -> None:
     ):
         await complete_profile_setup(callback.from_user.id)
         await clear_flow(callback.from_user.id)
-        await callback.message.answer("Команда исправлена. Профиль снова отправлен на проверку.")
+        await callback.message.answer("Департамент исправлен. Профиль снова отправлен на проверку.")
         await notify_owner_pending_activation(callback.from_user.id)
         await callback.answer()
         return
@@ -1616,7 +1700,7 @@ async def profile_edit_team_callback(callback: CallbackQuery) -> None:
         return
 
     await callback.message.answer(
-        "Выбери команду:",
+        "Выбери департамент:",
         reply_markup=profile_team_keyboard(mode="edit"),
     )
     await callback.answer()
@@ -1625,7 +1709,7 @@ async def profile_edit_team_callback(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("profile_team_edit:"))
 async def profile_team_edit_value_callback(callback: CallbackQuery) -> None:
     team = callback.data.split(":", 1)[1]
-    if team not in TEAM_LABELS:
+    if team not in REGISTRATION_TEAM_LABELS:
         await callback.answer("Неизвестная команда.", show_alert=True)
         return
 
@@ -1636,8 +1720,92 @@ async def profile_team_edit_value_callback(callback: CallbackQuery) -> None:
 
     await set_profile_team(callback.from_user.id, team)
     user = await get_user(callback.from_user.id)
-    await callback.message.answer("Команда обновлена.")
+    await callback.message.answer("Департамент обновлён.")
     await show_profile(callback.message, user)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "profile_org_team_choose")
+async def profile_org_team_choose_callback(callback: CallbackQuery) -> None:
+    user = await get_user(callback.from_user.id)
+    if (
+        not user or user["status"] not in {"active", "paused", "pending_activation"}
+        or user["deleted_at"] is not None or user["removed_by_admin"] == 1
+        or user["onboarding_step"] != "completed"
+    ):
+        await callback.answer("Профиль недоступен.", show_alert=True)
+        return
+
+    teams = await get_active_org_teams(user["team"] or "")
+    if not teams:
+        await callback.answer("В этом департаменте пока нет команд.", show_alert=True)
+        return
+    rows = [
+        [InlineKeyboardButton(text=row["name"][:64], callback_data=f"profile_org_team_set:{row['id']}")]
+        for row in teams
+    ]
+    if user["org_team_id"] is not None:
+        rows.append([InlineKeyboardButton(text="Не указывать команду", callback_data="profile_org_team_clear")])
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="profile_org_team_cancel")])
+    await callback.message.answer(
+        "Выбери команду своего департамента:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("profile_org_team_set:"))
+async def profile_org_team_set_callback(callback: CallbackQuery) -> None:
+    try:
+        team_id = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректная команда.", show_alert=True)
+        return
+    assert pool is not None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE users AS u
+            SET org_team_id=t.id, updated_at=NOW()
+            FROM org_teams AS t
+            WHERE u.user_id=$1 AND t.id=$2
+              AND u.team=t.department_key AND t.is_active=TRUE
+              AND u.status IN ('active','paused','pending_activation')
+              AND u.onboarding_step='completed'
+              AND u.deleted_at IS NULL AND u.removed_by_admin=0
+            RETURNING t.name
+        """, callback.from_user.id, team_id)
+    if not row:
+        await callback.answer("Команда недоступна. Открой профиль заново.", show_alert=True)
+        return
+    await callback.message.answer(f"Команда сохранена: {row['name']}.")
+    user = await get_user(callback.from_user.id)
+    await show_profile(callback.message, user)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "profile_org_team_clear")
+async def profile_org_team_clear_callback(callback: CallbackQuery) -> None:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE users
+            SET org_team_id=NULL, updated_at=NOW()
+            WHERE user_id=$1 AND status IN ('active','paused','pending_activation')
+              AND onboarding_step='completed'
+              AND deleted_at IS NULL AND removed_by_admin=0
+            RETURNING user_id
+        """, callback.from_user.id)
+    if not row:
+        await callback.answer("Профиль недоступен.", show_alert=True)
+        return
+    await callback.message.answer("Команда убрана из профиля.")
+    await show_profile(callback.message, await get_user(callback.from_user.id))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "profile_org_team_cancel")
+async def profile_org_team_cancel_callback(callback: CallbackQuery) -> None:
+    await callback.message.answer("Выбор команды отменён.")
     await callback.answer()
 
 
@@ -1671,7 +1839,7 @@ async def pending_activation_command(message: Message) -> None:
         await message.answer(
             "Профиль ждёт активации\n\n"
             f"{clean_name(user['display_name'])}\n"
-            f"Команда: {team}\n"
+            f"Департамент: {team}\n"
             f"Отвечает за: {(user['responsibility_text'] or '').strip()}\n"
             f"Telegram: {username}",
             reply_markup=pending_activation_keyboard(user["user_id"]),
@@ -1936,7 +2104,7 @@ def normalized_pair(user_a: int, user_b: int) -> tuple[int, int]:
 
 
 def pair_team_kind(team_a: str | None, team_b: str | None) -> str | None:
-    if not team_a or not team_b or team_a == "other" or team_b == "other":
+    if not team_a or not team_b or team_a in {"other", "external"} or team_b in {"other", "external"}:
         return None
     return "same" if team_a == team_b else "cross"
 
@@ -2689,15 +2857,12 @@ def thanks_search_results_keyboard(users: list[asyncpg.Record]) -> InlineKeyboar
 
 
 def thanks_team_browse_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Продажи", callback_data="thanks_team:sales")],
-            [InlineKeyboardButton(text="Операции", callback_data="thanks_team:operations")],
-            [InlineKeyboardButton(text="Маркетинг", callback_data="thanks_team:marketing")],
-            [InlineKeyboardButton(text="Другая команда", callback_data="thanks_team:other")],
-            [InlineKeyboardButton(text="Отмена", callback_data="thanks_cancel")],
-        ]
-    )
+    rows = [
+        [InlineKeyboardButton(text=label, callback_data=f"thanks_team:{team}")]
+        for team, label in REGISTRATION_TEAM_LABELS.items()
+    ]
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="thanks_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def thanks_team_users_keyboard(
@@ -3003,7 +3168,7 @@ async def thanks_search_again_callback(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "thanks_browse_teams")
 async def thanks_browse_teams_callback(callback: CallbackQuery) -> None:
     await callback.message.answer(
-        "Можно выбрать коллегу по команде:",
+        "Можно выбрать коллегу по департаменту:",
         reply_markup=thanks_team_browse_keyboard(),
     )
     await callback.answer()
@@ -3019,7 +3184,7 @@ async def thanks_team_callback(callback: CallbackQuery) -> None:
     keyboard = await thanks_team_users_keyboard(callback.from_user.id, team)
     if keyboard is None:
         await callback.message.answer(
-            "В этой команде сейчас не нашлось доступных получателей."
+            "В этом департаменте сейчас не нашлось доступных получателей."
         )
         await callback.answer()
         return
@@ -4491,6 +4656,7 @@ def admin_home_keyboard(owner: bool) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="Пользователи", callback_data="admin_users_menu")],
         [InlineKeyboardButton(text="Карточки сотрудников", callback_data="admin_profiles_menu")],
+        [InlineKeyboardButton(text="Команды и подразделения", callback_data="admin_org_teams_menu")],
         [InlineKeyboardButton(text="Сообщение всем", callback_data="admin_message_all")],
         [InlineKeyboardButton(text="Ждут активации", callback_data="admin_pending_menu")],
         [InlineKeyboardButton(text="Активность недели", callback_data="admin_week_activity")],
@@ -5044,7 +5210,7 @@ async def admin_profile_edit_callback(callback: CallbackQuery) -> None:
         "Выбери поле:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Имя и фамилия", callback_data=f"admin_profile_field:{target_id}:name")],
-            [InlineKeyboardButton(text="Команда", callback_data=f"admin_profile_field:{target_id}:team")],
+            [InlineKeyboardButton(text="Департамент", callback_data=f"admin_profile_field:{target_id}:team")],
             [InlineKeyboardButton(text="За что отвечает", callback_data=f"admin_profile_field:{target_id}:responsibility")],
             [InlineKeyboardButton(text="Вернуться к карточке", callback_data=f"admin_user:{target_id}")],
         ]),
@@ -5081,11 +5247,11 @@ async def admin_profile_field_callback(callback: CallbackQuery) -> None:
                 text=label or "Другая команда",
                 callback_data=f"admin_profile_team:{target_id}:{team}",
             )]
-            for team, label in TEAM_LABELS.items()
+            for team, label in REGISTRATION_TEAM_LABELS.items()
         ]
         rows.extend(cancel.inline_keyboard)
         await callback.message.answer(
-            "Выбери команду сотрудника:",
+            "Выбери департамент сотрудника:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
         )
     else:
@@ -5111,7 +5277,7 @@ async def admin_profile_team_callback(callback: CallbackQuery) -> None:
         return
     flow = await get_flow(callback.from_user.id)
     if (
-        team not in TEAM_LABELS or not flow
+        team not in REGISTRATION_TEAM_LABELS or not flow
         or flow["flow_type"] != "admin_profile_edit"
         or flow["step"] != "waiting_team"
         or flow["recipient_id"] != target_id
@@ -5126,7 +5292,7 @@ async def admin_profile_team_callback(callback: CallbackQuery) -> None:
     await set_profile_team(target_id, team)
     await audit_admin_action(callback.from_user.id, "admin_edit_team", target_user_id=target_id, object_type="user", object_id=target_id)
     await clear_flow(callback.from_user.id)
-    await callback.message.answer("Команда обновлена.")
+    await callback.message.answer("Департамент обновлён.")
     await send_admin_user_card(callback.message, target_id, callback.from_user.id)
     await callback.answer()
 
@@ -5175,7 +5341,7 @@ async def admin_profile_revision_start_callback(callback: CallbackQuery) -> None
         "Какое поле сотруднику нужно исправить?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Имя", callback_data=f"admin_profile_revision_field:{target_id}:name")],
-            [InlineKeyboardButton(text="Команда", callback_data=f"admin_profile_revision_field:{target_id}:team")],
+            [InlineKeyboardButton(text="Департамент", callback_data=f"admin_profile_revision_field:{target_id}:team")],
             [InlineKeyboardButton(text="Обязанности", callback_data=f"admin_profile_revision_field:{target_id}:responsibility")],
             [InlineKeyboardButton(text="Отмена", callback_data="admin_profiles_menu")],
         ]),
@@ -5244,6 +5410,290 @@ async def admin_profile_revision_cancel_callback(callback: CallbackQuery) -> Non
     await callback.answer()
 
 
+# Управление вложенными командами через админку. Департаменты фиксированы.
+@router.callback_query(F.data == "admin_org_teams_menu")
+async def admin_org_teams_menu_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    assert pool is not None
+    async with pool.acquire() as conn:
+        counts = await conn.fetch("""
+            SELECT department_key, COUNT(*) AS total
+            FROM org_teams WHERE is_active=TRUE GROUP BY department_key
+        """)
+    by_department = {row["department_key"]: row["total"] for row in counts}
+    rows = [
+        [InlineKeyboardButton(
+            text=f"{label} ({by_department.get(key, 0)})"[:64],
+            callback_data=f"admin_org_dept:{key}",
+        )]
+        for key, label in REGISTRATION_TEAM_LABELS.items()
+        if key != "external"
+    ]
+    rows.append([InlineKeyboardButton(text="← В админку", callback_data="admin_home")])
+    await callback.message.answer(
+        "Команды и подразделения\n\nВыбери департамент:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_org_dept:"))
+async def admin_org_dept_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    dept = callback.data.split(":", 1)[1]
+    if dept not in REGISTRATION_TEAM_LABELS or dept == "external":
+        await callback.answer("Неизвестный департамент.", show_alert=True)
+        return
+    teams = await get_active_org_teams(dept)
+    rows = [
+        [InlineKeyboardButton(
+            text=row["name"][:64],
+            callback_data=f"admin_org_team_view:{row['id']}",
+        )]
+        for row in teams
+    ]
+    rows.append([InlineKeyboardButton(
+        text="Добавить команду", callback_data=f"admin_org_team_add:{dept}",
+    )])
+    rows.append([InlineKeyboardButton(
+        text="← К департаментам", callback_data="admin_org_teams_menu",
+    )])
+    await callback.message.answer(
+        f"{REGISTRATION_TEAM_LABELS[dept]}\n\nКоманд: {len(teams)}. "
+        "Нажми на команду, чтобы переименовать её.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_org_team_view:"))
+async def admin_org_team_view_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        team_id = int(callback.data.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректная команда.", show_alert=True)
+        return
+    assert pool is not None
+    async with pool.acquire() as conn:
+        team = await conn.fetchrow("""
+            SELECT id, department_key, name FROM org_teams
+            WHERE id=$1 AND is_active=TRUE
+        """, team_id)
+        members = await conn.fetchval("""
+            SELECT COUNT(*) FROM users WHERE org_team_id=$1
+              AND deleted_at IS NULL AND removed_by_admin=0
+        """, team_id)
+    if not team:
+        await callback.answer("Команда больше недоступна.", show_alert=True)
+        return
+    dept = team["department_key"]
+    await callback.message.answer(
+        f"Команда: {team['name']}\n"
+        f"Департамент: {REGISTRATION_TEAM_LABELS.get(dept, dept)}\n"
+        f"Сотрудников: {members}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="Переименовать", callback_data=f"admin_org_team_rename:{team_id}",
+            )],
+            [InlineKeyboardButton(
+                text="← К командам", callback_data=f"admin_org_dept:{dept}",
+            )],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_org_team_add:"))
+async def admin_org_team_add_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    dept = callback.data.split(":", 1)[1]
+    if dept not in REGISTRATION_TEAM_LABELS or dept == "external":
+        await callback.answer("Неизвестный департамент.", show_alert=True)
+        return
+    await set_flow(
+        callback.from_user.id, "admin_org_team", "waiting_add_name", cycle_key=dept,
+    )
+    await callback.message.answer(
+        f"Новая команда в департаменте «{REGISTRATION_TEAM_LABELS[dept]}».\n"
+        "Отправь её название одним сообщением (2–100 символов).",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Отмена", callback_data="admin_org_team_cancel")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_org_team_rename:"))
+async def admin_org_team_rename_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        team_id = int(callback.data.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректная команда.", show_alert=True)
+        return
+    assert pool is not None
+    async with pool.acquire() as conn:
+        team = await conn.fetchrow("""
+            SELECT department_key, name FROM org_teams
+            WHERE id=$1 AND is_active=TRUE
+        """, team_id)
+    if not team or team["department_key"] not in REGISTRATION_TEAM_LABELS:
+        await callback.answer("Команда больше недоступна.", show_alert=True)
+        return
+    await set_flow(
+        callback.from_user.id, "admin_org_team", "waiting_rename_name",
+        cycle_key=team["department_key"], recipient_id=team_id,
+    )
+    await callback.message.answer(
+        f"Сейчас: {team['name']}\n\nВведи новое название (2–100 символов). "
+        "Оно поменяется у всех участников команды.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Отмена", callback_data="admin_org_team_cancel")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_org_team_cancel")
+async def admin_org_team_cancel_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    flow = await get_flow(callback.from_user.id)
+    if not flow or flow["flow_type"] != "admin_org_team":
+        await callback.answer("Диалог уже завершён.", show_alert=True)
+        return
+    await clear_flow(callback.from_user.id)
+    await callback.message.answer("Изменение команды отменено.")
+    await callback.answer()
+
+
+# Администратор назначает сотрудника во вложенную команду его департамента.
+@router.callback_query(F.data.startswith("admin_org_assign:"))
+async def admin_org_assign_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        target_id = int(callback.data.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректная карточка.", show_alert=True)
+        return
+    user = await get_user(target_id)
+    if (
+        not user or user["status"] not in {"active", "paused", "pending_activation"}
+        or user["deleted_at"] is not None or user["removed_by_admin"] == 1
+    ):
+        await callback.answer("Карточка недоступна.", show_alert=True)
+        return
+    dept = user["team"]
+    if dept not in REGISTRATION_TEAM_LABELS or dept == "external":
+        await callback.answer("Сначала укажи департамент в карточке.", show_alert=True)
+        return
+    teams = await get_active_org_teams(dept)
+    rows = [
+        [InlineKeyboardButton(
+            text=t["name"][:64],
+            callback_data=f"admin_org_assign_set:{target_id}:{t['id']}",
+        )]
+        for t in teams
+    ]
+    if user["org_team_id"] is not None:
+        rows.append([InlineKeyboardButton(
+            text="Убрать назначение", callback_data=f"admin_org_assign_clear:{target_id}",
+        )])
+    rows.append([InlineKeyboardButton(
+        text="← К карточке", callback_data=f"admin_user:{target_id}",
+    )])
+    await callback.message.answer(
+        f"Сотрудник: {clean_name(user['display_name'])}\n"
+        f"Департамент: {REGISTRATION_TEAM_LABELS[dept]}\n\n"
+        + ("Выбери команду:" if teams else "В этом департаменте пока нет команд. Добавь команду в разделе админки."),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_org_assign_set:"))
+async def admin_org_assign_set_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        _, target_text, team_text = callback.data.rsplit(":", 2)
+        target_id, team_id = int(target_text), int(team_text)
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный выбор.", show_alert=True)
+        return
+    assert pool is not None
+    async with pool.acquire() as conn:
+        assigned = await conn.fetchrow("""
+            UPDATE users AS u
+            SET org_team_id=t.id, updated_at=NOW()
+            FROM org_teams AS t
+            WHERE u.user_id=$1 AND t.id=$2
+              AND u.team=t.department_key AND t.is_active=TRUE
+              AND u.status IN ('active', 'paused', 'pending_activation')
+              AND u.deleted_at IS NULL AND u.removed_by_admin=0
+            RETURNING t.name
+        """, target_id, team_id)
+    if not assigned:
+        await callback.answer(
+            "Нельзя назначить: команда или департамент изменились.", show_alert=True,
+        )
+        return
+    await audit_admin_action(
+        callback.from_user.id, "admin_org_team_assigned",
+        target_user_id=target_id, object_type="org_team", object_id=team_id,
+    )
+    await callback.message.answer(f"Команда назначена: {assigned['name']}.")
+    await send_admin_user_card(callback.message, target_id, callback.from_user.id)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_org_assign_clear:"))
+async def admin_org_assign_clear_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        target_id = int(callback.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректная карточка.", show_alert=True)
+        return
+    assert pool is not None
+    async with pool.acquire() as conn:
+        cleared = await conn.fetchval("""
+            UPDATE users
+            SET org_team_id=NULL, updated_at=NOW()
+            WHERE user_id=$1 AND org_team_id IS NOT NULL
+              AND status IN ('active', 'paused', 'pending_activation')
+              AND deleted_at IS NULL AND removed_by_admin=0
+            RETURNING user_id
+        """, target_id)
+    if not cleared:
+        await callback.answer("Назначение уже снято или карточка недоступна.", show_alert=True)
+        return
+    await audit_admin_action(
+        callback.from_user.id, "admin_org_team_unassigned",
+        target_user_id=target_id, object_type="user", object_id=target_id,
+    )
+    await callback.message.answer("Назначение команды снято.")
+    await send_admin_user_card(callback.message, target_id, callback.from_user.id)
+    await callback.answer()
+
+
 async def get_admin_user_metrics(user_id: int, cycle_key: str) -> dict:
     assert pool is not None
     async with pool.acquire() as conn:
@@ -5291,6 +5741,27 @@ async def send_admin_user_card(message: Message, user_id: int, viewer_id: int) -
     created = user["created_at"].strftime("%d.%m.%Y") if user["created_at"] else "—"
     response = {"yes": "участвует", "no": "пропускает", None: "не ответил"}.get(metrics["this_week"], "—")
 
+    # This is a nested team within the employee's department, not the department itself.
+    can_assign_org_team = (
+        user["team"] in REGISTRATION_TEAM_LABELS
+        and user["team"] != "external"
+        and user["status"] in {"active", "paused", "pending_activation"}
+        and user["deleted_at"] is None
+        and user["removed_by_admin"] == 0
+    )
+    nested_team_name = None
+    if can_assign_org_team and user["org_team_id"] is not None:
+        assert pool is not None
+        async with pool.acquire() as conn:
+            nested_team_name = await conn.fetchval(
+                "SELECT name FROM org_teams WHERE id=$1",
+                user["org_team_id"],
+            )
+
+    org_team_line = (
+        f"Команда: {nested_team_name or 'не выбрана'}\n"
+        if can_assign_org_team else ""
+    )
     buttons = []
     if user["status"] == "access_denied":
         buttons.append([InlineKeyboardButton(text="Вернуть доступ", callback_data=f"admin_restore:{user_id}")])
@@ -5312,6 +5783,12 @@ async def send_admin_user_card(message: Message, user_id: int, viewer_id: int) -
             text="Редактировать карточку", callback_data=f"admin_profile_edit:{user_id}"
         )])
 
+    if can_assign_org_team:
+        buttons.append([InlineKeyboardButton(
+            text="Назначить / изменить команду",
+            callback_data=f"admin_org_assign:{user_id}",
+        )])
+
     if is_owner(viewer_id) and user_id != ADMIN_ID and user["status"] == "active" and user["active"] == 1:
         if user["role"] == "admin":
             buttons.append([InlineKeyboardButton(text="Убрать роль администратора", callback_data=f"admin_role_remove:{user_id}")])
@@ -5323,7 +5800,8 @@ async def send_admin_user_card(message: Message, user_id: int, viewer_id: int) -
         f"{profile_title(user)}\n"
         f"Telegram: {username}\n"
         f"Отвечает за: {responsibility}\n"
-        f"Команда: {team}\n"
+        f"Департамент: {team}\n"
+        f"{org_team_line}"
         f"Статус: {admin_status_label(user)}\n"
         f"Роль: {user['role']}\n"
         f"Регистрация: {created}\n\n"
@@ -5397,7 +5875,7 @@ async def admin_pending_menu_callback(callback: CallbackQuery) -> None:
             await callback.message.answer(
                 "Профиль ждёт активации\n\n"
                 f"{clean_name(user['display_name'])}\n"
-                f"Команда: {team}\n"
+                f"Департамент: {team}\n"
                 f"Отвечает за: {(user['responsibility_text'] or '').strip()}\n"
                 f"Telegram: {username}",
                 reply_markup=pending_activation_keyboard(user["user_id"]),
@@ -6088,7 +6566,7 @@ async def flow_message_handler(message: Message) -> None:
             return
         field = admin_flow["cycle_key"]
         target_id = admin_flow["recipient_id"]
-        field_names = {"name": "имя", "team": "команду", "responsibility": "описание обязанностей"}
+        field_names = {"name": "имя", "team": "департамент", "responsibility": "описание обязанностей"}
         if field not in field_names or not target_id:
             await clear_flow(message.from_user.id)
             await message.answer("Некорректный запрос. Начни заново.")
@@ -6169,7 +6647,7 @@ async def flow_message_handler(message: Message) -> None:
             await set_responsibility_text(target_id, text)
             action = "admin_edit_responsibility"
         else:
-            await message.answer("Выбери команду кнопкой или отмени редактирование.")
+            await message.answer("Выбери департамент кнопкой или отмени редактирование.")
             return
         await audit_admin_action(message.from_user.id, action, target_user_id=target_id, object_type="user", object_id=target_id)
         await clear_flow(message.from_user.id)
@@ -6223,6 +6701,81 @@ async def flow_message_handler(message: Message) -> None:
             return
 
         await message.answer("Используй кнопки подтверждения или отмены под предпросмотром.")
+        return
+
+    # Создание и переименование команд сотрудниками с ролью администратора.
+    team_flow = await get_flow(message.from_user.id)
+    if team_flow and team_flow["flow_type"] == "admin_org_team":
+        if not is_admin(message.from_user.id):
+            await clear_flow(message.from_user.id)
+            await message.answer("Нет доступа.")
+            return
+        name = " ".join(text.split())
+        if "\n" in text or not 2 <= len(name) <= 100:
+            await message.answer("Название — одна строка от 2 до 100 символов.")
+            return
+        dept = team_flow["cycle_key"]
+        if dept not in REGISTRATION_TEAM_LABELS or dept == "external":
+            await clear_flow(message.from_user.id)
+            await message.answer("Неизвестный департамент. Открой раздел команд снова.")
+            return
+
+        assert pool is not None
+        if team_flow["step"] == "waiting_add_name":
+            async with pool.acquire() as conn:
+                team_id = await conn.fetchval("""
+                    INSERT INTO org_teams (department_key, name)
+                    SELECT $1, $2
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM org_teams
+                        WHERE department_key=$1 AND is_active=TRUE
+                          AND LOWER(name)=LOWER($2)
+                    )
+                    RETURNING id
+                """, dept, name)
+            if team_id is None:
+                await message.answer("Такая команда уже существует. Введи другое название.")
+                return
+            await audit_admin_action(
+                message.from_user.id, "admin_org_team_created",
+                object_type="org_team", object_id=team_id,
+            )
+            await clear_flow(message.from_user.id)
+            await message.answer(
+                f"Команда «{name}» создана в департаменте «{REGISTRATION_TEAM_LABELS[dept]}»."
+            )
+            return
+
+        if team_flow["step"] == "waiting_rename_name" and team_flow["recipient_id"]:
+            team_id = team_flow["recipient_id"]
+            async with pool.acquire() as conn:
+                renamed = await conn.fetchrow("""
+                    UPDATE org_teams AS t
+                    SET name=$2, updated_at=NOW()
+                    WHERE t.id=$1 AND t.department_key=$3 AND t.is_active=TRUE
+                      AND NOT EXISTS (
+                          SELECT 1 FROM org_teams AS other
+                          WHERE other.department_key=$3 AND other.is_active=TRUE
+                            AND other.id <> $1 AND LOWER(other.name)=LOWER($2)
+                      )
+                    RETURNING t.id
+                """, team_id, name, dept)
+            if not renamed:
+                await message.answer(
+                    "Не удалось переименовать: название уже занято или команда недоступна. "
+                    "Введи другое название или нажми «Отмена»."
+                )
+                return
+            await audit_admin_action(
+                message.from_user.id, "admin_org_team_renamed",
+                object_type="org_team", object_id=team_id,
+            )
+            await clear_flow(message.from_user.id)
+            await message.answer(f"Команда переименована: «{name}». Участники сохранены.")
+            return
+
+        await clear_flow(message.from_user.id)
+        await message.answer("Диалог команды сброшен. Открой раздел «Команды и подразделения».")
         return
 
     # Новый онбординг и одноразовая миграция профиля хранят текущий шаг в users,
