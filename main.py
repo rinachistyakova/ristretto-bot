@@ -410,6 +410,27 @@ async def init_db() -> None:
             )
         """)
 
+        await conn.execute("ALTER TABLE user_flows ADD COLUMN IF NOT EXISTS target_group TEXT")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS group_thanks (
+                id BIGSERIAL PRIMARY KEY,
+                cycle_key TEXT NOT NULL,
+                sender_id BIGINT NOT NULL REFERENCES users(user_id),
+                target_name TEXT NOT NULL,
+                message_text TEXT NOT NULL,
+                public_text TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                moderated_by BIGINT,
+                moderated_at TIMESTAMPTZ,
+                moderation_reason TEXT
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_group_thanks_cycle_status
+            ON group_thanks(cycle_key, status)
+        """)
+
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_active ON users(active)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_confirmed_cycle ON users(confirmed_cycle)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_match_groups_cycle ON match_groups(cycle_key)")
@@ -910,15 +931,16 @@ async def set_flow(
     recipient_id: int | None = None,
     draft_text: str | None = None,
     include_in_digest: int | None = None,
+    target_group: str | None = None,
 ) -> None:
     assert pool is not None
     async with pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO user_flows (
                 user_id, flow_type, step, cycle_key, recipient_id,
-                draft_text, include_in_digest, updated_at
+                draft_text, include_in_digest, target_group, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
             ON CONFLICT (user_id)
             DO UPDATE SET
                 flow_type=EXCLUDED.flow_type,
@@ -927,8 +949,10 @@ async def set_flow(
                 recipient_id=EXCLUDED.recipient_id,
                 draft_text=EXCLUDED.draft_text,
                 include_in_digest=EXCLUDED.include_in_digest,
+                target_group=EXCLUDED.target_group,
                 updated_at=NOW()
-        """, user_id, flow_type, step, cycle_key, recipient_id, draft_text, include_in_digest)
+        """, user_id, flow_type, step, cycle_key, recipient_id, draft_text,
+             include_in_digest, target_group)
 
 
 async def get_flow(user_id: int):
@@ -2522,7 +2546,9 @@ def lookup_variants(query: str) -> set[str]:
 
 
 def thanks_mode_label(include_in_digest: int) -> str:
-    return "лично + в дайджест" if include_in_digest else "только лично"
+    if include_in_digest == 2:
+        return "анонимно, только в дайджест"
+    return "лично + в дайджест" if include_in_digest == 1 else "только лично"
 
 
 async def get_open_thanks_cycle() -> str:
@@ -2709,6 +2735,7 @@ def thanks_visibility_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="Только лично", callback_data="thanks_mode:private")],
             [InlineKeyboardButton(text="Лично + в дайджест", callback_data="thanks_mode:digest")],
+            [InlineKeyboardButton(text="Анонимно, только в дайджест", callback_data="thanks_mode:anonymous_digest")],
             [InlineKeyboardButton(text="Отмена", callback_data="thanks_cancel")],
         ]
     )
@@ -2815,8 +2842,142 @@ async def begin_thanks(message: Message, sender_id: int) -> None:
     await set_flow(sender_id, "thanks", "waiting_recipient_query")
     await message.answer(
         "Кого хочешь поблагодарить?\n\n"
-        "Напиши имя или @username. Можно как помнишь :)"
+        "Напиши имя или @username. Можно как помнишь :)\n\n"
+        "Или выбери благодарность команде или рабочей группе.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="Поблагодарить команду или группу",
+                callback_data="thanks_group_start",
+            )]
+        ]),
     )
+
+
+async def begin_group_thanks(message: Message, sender_id: int) -> None:
+    user = await get_user(sender_id)
+    if not user or user["status"] in {"self_deleted", "access_denied", "pending_activation"}:
+        await message.answer("Сначала зарегистрируй и активируй свой профиль в боте.")
+        return
+    if user["status"] not in {"active", "paused"} or user["deleted_at"] is not None or user["removed_by_admin"] == 1:
+        await message.answer("Сейчас благодарности недоступны.")
+        return
+
+    await set_flow(sender_id, "thanks_group", "waiting_group", cycle_key=await get_open_thanks_cycle())
+    await message.answer(
+        "Как называется команда или рабочая группа? Напиши название свободным текстом "
+        "(до 80 символов)."
+    )
+
+
+@router.callback_query(F.data == "thanks_group_start")
+async def thanks_group_start_callback(callback: CallbackQuery) -> None:
+    await begin_group_thanks(callback.message, callback.from_user.id)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "thanks_group_cancel")
+async def thanks_group_cancel_callback(callback: CallbackQuery) -> None:
+    flow = await get_flow(callback.from_user.id)
+    if not flow or flow["flow_type"] != "thanks_group":
+        await callback.answer("Черновик уже закрыт.", show_alert=True)
+        return
+    await clear_flow(callback.from_user.id)
+    await callback.message.answer("Благодарность команде отменена.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "thanks_group_edit")
+async def thanks_group_edit_callback(callback: CallbackQuery) -> None:
+    flow = await get_flow(callback.from_user.id)
+    if not flow or flow["flow_type"] != "thanks_group" or flow["step"] != "confirm":
+        await callback.answer("Черновик не найден.", show_alert=True)
+        return
+    await set_flow(
+        callback.from_user.id, "thanks_group", "waiting_text",
+        cycle_key=flow["cycle_key"], target_group=flow["target_group"],
+    )
+    await callback.message.answer("Напиши исправленный текст благодарности.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "thanks_group_send")
+async def thanks_group_send_callback(callback: CallbackQuery) -> None:
+    assert pool is not None
+    thanks_id = None
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            flow = await conn.fetchrow("""
+                SELECT * FROM user_flows
+                WHERE user_id=$1 FOR UPDATE
+            """, callback.from_user.id)
+            if (
+                not flow or flow["flow_type"] != "thanks_group"
+                or flow["step"] != "confirm"
+                or not flow["target_group"] or not flow["draft_text"]
+            ):
+                await callback.answer("Черновик уже отправлен или отменён.", show_alert=True)
+                return
+            allowed = await conn.fetchval("""
+                SELECT 1 FROM users
+                WHERE user_id=$1 AND status IN ('active', 'paused')
+                  AND deleted_at IS NULL AND removed_by_admin=0
+            """, callback.from_user.id)
+            if not allowed:
+                await callback.answer("Отправка сейчас недоступна.", show_alert=True)
+                return
+            digest_status = await conn.fetchval(
+                "SELECT status FROM digest_runs WHERE cycle_key=$1", flow["cycle_key"]
+            )
+            if digest_status in {"approved", "published"}:
+                await callback.answer(
+                    "Дайджест уже закрыт. Начни новую благодарность через /thanks.",
+                    show_alert=True,
+                )
+                return
+
+            thanks_id = await conn.fetchval("""
+                INSERT INTO group_thanks (
+                    cycle_key, sender_id, target_name, message_text,
+                    public_text, status, created_at
+                ) VALUES ($1, $2, $3, $4, $5, 'pending', NOW())
+                RETURNING id
+            """, flow["cycle_key"], callback.from_user.id, flow["target_group"],
+                 flow["draft_text"], truncate_public_thanks(flow["draft_text"]))
+            await conn.execute(
+                "DELETE FROM user_flows WHERE user_id=$1", callback.from_user.id
+            )
+
+    await callback.answer()
+    await callback.message.answer(
+        "Готово. Благодарность команде передана на модерацию пятничного дайджеста. "
+        "Имя автора в публикации не показываем. Личного сообщения не будет."
+    )
+    if thanks_id:
+        await notify_group_thanks_moderation(thanks_id)
+
+
+async def notify_group_thanks_moderation(thanks_id: int) -> None:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        item = await conn.fetchrow("""
+            SELECT g.id, g.target_name, g.public_text, g.status,
+                   sender.display_name AS author_name
+            FROM group_thanks g JOIN users sender ON sender.user_id=g.sender_id
+            WHERE g.id=$1
+        """, thanks_id)
+    if not item or item["status"] != "pending":
+        return
+    try:
+        await safe_send_message(
+            ADMIN_ID,
+            "Благодарность команде ждёт модерации\n\n"
+            f"Команда или группа: {item['target_name']}\n"
+            f"Автор: {clean_name(item['author_name'])}\n\n"
+            f"«{item['public_text']}»",
+            reply_markup=group_thanks_moderation_keyboard(item["id"]),
+        )
+    except Exception:
+        logging.exception("Не удалось отправить групповую благодарность на модерацию")
 
 
 @router.message(Command("thanks"))
@@ -2904,7 +3065,7 @@ async def thanks_recipient_callback(callback: CallbackQuery) -> None:
 
     await callback.message.answer(
         f"Напиши текст благодарности для {clean_name(recipient['display_name'])}.\n\n"
-        "Получатель увидит твоё имя в личном сообщении."
+        "Далее можно выбрать личную отправку или анонимную публикацию в дайджесте."
     )
     await callback.answer()
 
@@ -2974,6 +3135,34 @@ async def thanks_mode_callback(callback: CallbackQuery) -> None:
         await callback.answer()
         return
 
+    if mode == "anonymous_digest":
+        await callback.message.answer(
+            "Благодарность увидят все участники в пятничном дайджесте "
+            "после модерации. Лично получателю она не придёт. "
+            "Имя автора в дайджесте скрыто, но доступно администраторам. "
+            "Для публикации используем до 200 знаков."
+        )
+        if len(" ".join(flow["draft_text"].split())) > THANKS_PUBLIC_LIMIT:
+            public_text = truncate_public_thanks(flow["draft_text"])
+            await set_flow(
+                callback.from_user.id,
+                "thanks",
+                "public_truncate_preview",
+                cycle_key=flow["cycle_key"],
+                recipient_id=flow["recipient_id"],
+                draft_text=flow["draft_text"],
+                include_in_digest=2,
+            )
+            await callback.message.answer(
+                "Для пятничного дайджеста получится так:\n\n"
+                f"«{public_text}»",
+                reply_markup=thanks_public_truncate_keyboard(),
+            )
+        else:
+            await send_thanks_final_preview(callback.message, callback.from_user.id, 2)
+        await callback.answer()
+        return
+
     if mode != "digest":
         await callback.answer("Неизвестный режим.", show_alert=True)
         return
@@ -3022,7 +3211,9 @@ async def thanks_public_keep_callback(callback: CallbackQuery) -> None:
         await callback.answer("Черновик не найден.", show_alert=True)
         return
 
-    await send_thanks_final_preview(callback.message, callback.from_user.id, 1)
+    await send_thanks_final_preview(
+        callback.message, callback.from_user.id, int(flow["include_in_digest"] or 1)
+    )
     await callback.answer()
 
 
@@ -3041,8 +3232,8 @@ async def thanks_public_rewrite_callback(callback: CallbackQuery) -> None:
         recipient_id=flow["recipient_id"],
     )
     await callback.message.answer(
-        "Напиши новый текст. Получателю он придёт целиком; "
-        "для дайджеста постарайся уложиться в 200 знаков."
+        "Напиши новый текст благодарности. Для дайджеста постарайся "
+        "уложиться в 200 знаков; затем снова выберешь способ отправки."
     )
     await callback.answer()
 
@@ -3078,10 +3269,12 @@ async def save_thanks_from_flow(user_id: int, flow: asyncpg.Record) -> int | Non
 
     if not sender or not recipient:
         return None
-
-    if sender["status"] not in {"active", "paused"}:
+    if (
+        sender["status"] not in {"active", "paused"}
+        or sender["deleted_at"] is not None
+        or sender["removed_by_admin"] == 1
+    ):
         return None
-
     if (
         recipient["status"] != "active"
         or recipient["active"] != 1
@@ -3089,53 +3282,73 @@ async def save_thanks_from_flow(user_id: int, flow: asyncpg.Record) -> int | Non
         or recipient["removed_by_admin"] == 1
     ):
         return None
-
     if await is_thanks_blocked(recipient["user_id"], user_id):
         return None
 
-    cycle_key = flow["cycle_key"]
     assert pool is not None
     async with pool.acquire() as conn:
-        digest_status = await conn.fetchval(
-            "SELECT status FROM digest_runs WHERE cycle_key=$1",
-            cycle_key,
-        )
-        if digest_status in {"approved", "published"}:
-            return None
+        async with conn.transaction():
+            # Claim the draft while holding a row lock. Concurrent taps wait here;
+            # the first successful send consumes the draft in the same transaction.
+            locked = await conn.fetchrow("""
+                SELECT * FROM user_flows
+                WHERE user_id=$1 AND flow_type='thanks' AND step='confirm'
+                FOR UPDATE
+            """, user_id)
+            if (
+                not locked
+                or locked["cycle_key"] != flow["cycle_key"]
+                or locked["recipient_id"] != flow["recipient_id"]
+                or locked["draft_text"] != flow["draft_text"]
+                or locked["include_in_digest"] != flow["include_in_digest"]
+            ):
+                return None
 
-        include_in_digest = int(flow["include_in_digest"] or 0)
-        public_text = (
-            truncate_public_thanks(flow["draft_text"])
-            if include_in_digest
-            else None
-        )
-        public_status = "pending" if include_in_digest else "not_requested"
-
-        thanks_id = await conn.fetchval("""
-            INSERT INTO thanks (
-                cycle_key, sender_id, recipient_id,
-                sender_name, recipient_name, message_text,
-                include_in_digest, created_at,
-                public_text, personal_status, public_status
+            digest_status = await conn.fetchval(
+                "SELECT status FROM digest_runs WHERE cycle_key=$1",
+                locked["cycle_key"],
             )
-            VALUES (
-                $1, $2, $3, $4, $5, $6, $7, NOW(),
-                $8, 'pending', $9
-            )
-            RETURNING id
-        """,
-            cycle_key,
-            user_id,
-            recipient["user_id"],
-            clean_name(sender["display_name"]),
-            clean_name(recipient["display_name"]),
-            flow["draft_text"],
-            include_in_digest,
-            public_text,
-            public_status,
-        )
-    return thanks_id
+            if digest_status in {"approved", "published"}:
+                return None
 
+            mode = int(locked["include_in_digest"] or 0)
+            include_in_digest = 1 if mode in (1, 2) else 0
+            personal_status = "cancelled" if mode == 2 else "pending"
+            public_text = (
+                truncate_public_thanks(locked["draft_text"])
+                if include_in_digest else None
+            )
+            public_status = "pending" if include_in_digest else "not_requested"
+
+            thanks_id = await conn.fetchval("""
+                INSERT INTO thanks (
+                    cycle_key, sender_id, recipient_id,
+                    sender_name, recipient_name, message_text,
+                    include_in_digest, created_at,
+                    public_text, personal_status, public_status
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, NOW(),
+                    $8, $9, $10
+                )
+                RETURNING id
+            """,
+                locked["cycle_key"],
+                user_id,
+                recipient["user_id"],
+                clean_name(sender["display_name"]),
+                clean_name(recipient["display_name"]),
+                locked["draft_text"],
+                include_in_digest,
+                public_text,
+                personal_status,
+                public_status,
+            )
+            await conn.execute("""
+                DELETE FROM user_flows
+                WHERE user_id=$1 AND flow_type='thanks' AND step='confirm'
+            """, user_id)
+            return thanks_id
 
 async def get_public_thanks_for_moderation(thanks_id: int):
     assert pool is not None
@@ -3192,19 +3405,24 @@ async def thanks_send_callback(callback: CallbackQuery) -> None:
 
     thanks_id = await save_thanks_from_flow(callback.from_user.id, flow)
     include_in_digest = int(flow["include_in_digest"] or 0)
-    await clear_flow(callback.from_user.id)
 
     if not thanks_id:
         await callback.message.answer(
-            "Не удалось сохранить благодарность: получатель сейчас недоступен, "
-            "закрыл благодарности от тебя или выпуск этой недели уже закрыт."
+            "Сообщение уже обработано либо сейчас отправка недоступна. "
+            "Начни снова через /thanks."
         )
         await callback.answer()
         return
 
-    await callback.message.answer(
-        "Готово. В пятницу я доставлю благодарность :)"
-    )
+    if include_in_digest == 2:
+        await callback.message.answer(
+            "Готово. Благодарность передана на модерацию для пятничного дайджеста. "
+            "Личного сообщения получателю не будет."
+        )
+    else:
+        await callback.message.answer(
+            "Готово. В пятницу я доставлю благодарность."
+        )
     if include_in_digest:
         await notify_public_thanks_moderation(thanks_id)
 
@@ -3435,8 +3653,8 @@ async def moderate_public_thanks(
     if action == "keep":
         return True, "Оставлено в пятничных хайлайтах."
     if action == "remove":
-        return True, "Убрано из дайджеста. Личная благодарность останется."
-    return True, "Убрано из дайджеста, личная доставка отменена, автору закрыт доступ."
+        return True, "Убрано из дайджеста."
+    return True, "Убрано из дайджеста, автору закрыт доступ."
 
 
 @router.callback_query(F.data.startswith("thanks_mod_keep:"))
@@ -3478,6 +3696,103 @@ async def thanks_mod_revoke_callback(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+def group_thanks_moderation_keyboard(thanks_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Оставить", callback_data=f"group_thanks_keep:{thanks_id}")],
+        [InlineKeyboardButton(text="Убрать из дайджеста", callback_data=f"group_thanks_remove:{thanks_id}")],
+        [InlineKeyboardButton(text="Убрать и закрыть автору доступ", callback_data=f"group_thanks_revoke:{thanks_id}")],
+    ])
+
+
+async def moderate_group_thanks(thanks_id: int, admin_id: int, action: str) -> tuple[bool, str]:
+    if action not in {"keep", "remove", "revoke"}:
+        return False, "Неизвестное действие."
+    assert pool is not None
+    with_admin_refresh = False
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            item = await conn.fetchrow(
+                "SELECT * FROM group_thanks WHERE id=$1 FOR UPDATE", thanks_id
+            )
+            if not item or item["status"] not in {"pending", "approved"}:
+                return False, "Благодарность недоступна или уже обработана."
+            digest_status = await conn.fetchval(
+                "SELECT status FROM digest_runs WHERE cycle_key=$1", item["cycle_key"]
+            )
+            if digest_status in {"approved", "published"}:
+                return False, "Выпуск уже одобрен или опубликован."
+            if action == "revoke" and item["sender_id"] == ADMIN_ID:
+                return False, "Нельзя закрыть доступ владельцу бота."
+            target_status = "approved" if action == "keep" else "removed"
+            await conn.execute("""
+                UPDATE group_thanks
+                SET status=$2, moderated_by=$3, moderated_at=NOW(),
+                    moderation_reason=$4
+                WHERE id=$1
+            """, thanks_id, target_status, admin_id,
+                None if action == "keep" else "admin_removed" if action == "remove" else "admin_removed_and_revoked")
+            if action == "revoke":
+                await conn.execute("""
+                    UPDATE users SET status='access_denied', active=0, role='user',
+                        removed_by_admin=1, confirmed_cycle=NULL,
+                        access_denied_at=NOW(),
+                        access_denied_reason='thanks_moderation_abuse',
+                        updated_at=NOW()
+                    WHERE user_id=$1
+                """, item["sender_id"])
+                with_admin_refresh = True
+            await conn.execute("""
+                INSERT INTO admin_audit_log (
+                    admin_user_id, action, target_user_id,
+                    object_type, object_id, metadata, created_at
+                ) VALUES ($1, $2, $3, 'group_thanks', $4, '{}'::jsonb, NOW())
+            """, admin_id, "group_thanks_" + action, item["sender_id"], thanks_id)
+    if with_admin_refresh:
+        await refresh_admin_cache()
+    return True, (
+        "Оставлено в дайджесте." if action == "keep" else
+        "Убрано из дайджеста." if action == "remove" else
+        "Убрано из дайджеста, автору закрыт доступ."
+    )
+
+
+@router.callback_query(F.data.startswith("group_thanks_keep:"))
+@router.callback_query(F.data.startswith("group_thanks_remove:"))
+@router.callback_query(F.data.startswith("group_thanks_revoke:"))
+async def group_thanks_moderate_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    kind, id_text = callback.data.split(":", 1)
+    action = kind.rsplit("_", 1)[-1]
+    ok, result = await moderate_group_thanks(int(id_text), callback.from_user.id, action)
+    if ok:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(result)
+    await callback.answer()
+
+
+async def get_group_moderation_queue(cycle_key: str):
+    assert pool is not None
+    async with pool.acquire() as conn:
+        return await conn.fetch("""
+            SELECT g.id, g.target_name, g.public_text, g.status,
+                   sender.display_name AS author_name
+            FROM group_thanks g JOIN users sender ON sender.user_id=g.sender_id
+            WHERE g.cycle_key=$1 AND g.status IN ('pending', 'approved')
+            ORDER BY g.created_at, g.id
+        """, cycle_key)
+
+
+async def get_pending_group_moderation(cycle_key: str) -> int:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        return await conn.fetchval("""
+            SELECT COUNT(*) FROM group_thanks
+            WHERE cycle_key=$1 AND status='pending'
+        """, cycle_key)
+
+
 async def get_pending_public_moderation(cycle_key: str):
     assert pool is not None
     async with pool.acquire() as conn:
@@ -3516,13 +3831,15 @@ async def get_public_moderation_queue(cycle_key: str):
 
 async def send_pending_moderation_queue(target: Message, cycle_key: str) -> None:
     rows = await get_public_moderation_queue(cycle_key)
-    if not rows:
+    groups = await get_group_moderation_queue(cycle_key)
+    if not rows and not groups:
         await target.answer("В публичном выпуске сейчас нет элементов для модерации.")
         return
 
     pending_count = sum(1 for row in rows if row["public_status"] == "pending")
+    pending_count += sum(1 for row in groups if row["status"] == "pending")
     await target.answer(
-        f"Публичных благодарностей: {len(rows)}. "
+        f"Публичных благодарностей: {len(rows) + len(groups)}. "
         f"Ещё ждут решения: {pending_count}."
     )
     for row in rows:
@@ -3535,7 +3852,15 @@ async def send_pending_moderation_queue(target: Message, cycle_key: str) -> None
             f"«{row['public_text'] or truncate_public_thanks(row['message_text'])}»",
             reply_markup=thanks_moderation_keyboard(row["id"]),
         )
-
+    for row in groups:
+        status_label = "ждёт решения" if row["status"] == "pending" else "оставлена"
+        await target.answer(
+            f"Команда или группа: {row['target_name']}\n"
+            f"Автор: {clean_name(row['author_name'])}\n"
+            f"Статус: {status_label}\n\n"
+            f"«{row['public_text']}»",
+            reply_markup=group_thanks_moderation_keyboard(row["id"]),
+        )
 
 async def reconcile_pending_thanks(cycle_key: str) -> None:
     """Cancels undeliverable pending thanks without exposing private content."""
@@ -3607,6 +3932,20 @@ async def reconcile_pending_thanks(cycle_key: str) -> None:
                   )
             """, cycle_key)
 
+            await conn.execute("""
+                UPDATE group_thanks g
+                SET status='removed', moderation_reason='author_unavailable',
+                    moderated_at=NOW()
+                FROM users sender
+                WHERE g.cycle_key=$1
+                  AND g.sender_id=sender.user_id
+                  AND g.status IN ('pending', 'approved')
+                  AND (
+                      sender.status IN ('self_deleted', 'access_denied')
+                      OR sender.deleted_at IS NOT NULL OR sender.removed_by_admin=1
+                  )
+            """, cycle_key)
+
 
 async def ensure_digest_run(cycle_key: str) -> str:
     assert pool is not None
@@ -3637,13 +3976,10 @@ async def build_public_digest_v2(cycle_key: str) -> str | None:
 
     assert pool is not None
     async with pool.acquire() as conn:
-        rows = list(await conn.fetch("""
+        people = list(await conn.fetch("""
             SELECT
-                t.id,
-                t.public_text,
-                t.message_text,
-                recipient.display_name,
-                recipient.team
+                t.id, t.public_text, t.message_text,
+                recipient.display_name, recipient.team
             FROM thanks t
             JOIN users recipient ON recipient.user_id=t.recipient_id
             WHERE t.cycle_key=$1
@@ -3655,23 +3991,35 @@ async def build_public_digest_v2(cycle_key: str) -> str | None:
               AND recipient.removed_by_admin=0
             ORDER BY t.id
         """, cycle_key))
+        groups = list(await conn.fetch("""
+            SELECT id, target_name, public_text
+            FROM group_thanks
+            WHERE cycle_key=$1 AND status='approved'
+            ORDER BY id
+        """, cycle_key))
 
-    if not rows:
+    items = [("person", row) for row in people] + [("group", row) for row in groups]
+    if not items:
         return None
 
     rng = random.Random(f"thanks-digest:{cycle_key}")
-    rng.shuffle(rows)
+    rng.shuffle(items)
 
     parts = [
         "Пятничные хайлайты спасибо 🤍\n\n"
         "Собрал благодарности, которые коллегам было важно подсветить всей команде."
     ]
-    for row in rows:
+    for kind, row in items:
+        if kind == "group":
+            parts.append(
+                f"Говорим спасибо команде или группе: {row['target_name']}\n"
+                f"«{row['public_text']}»"
+            )
+            continue
         recipient_title = clean_name(row["display_name"])
         label = team_label(row["team"])
         if label:
             recipient_title = f"{recipient_title} · {label}"
-
         public_text = row["public_text"] or truncate_public_thanks(row["message_text"])
         parts.append(
             f"Говорим спасибо: {recipient_title}\n"
@@ -3679,7 +4027,6 @@ async def build_public_digest_v2(cycle_key: str) -> str | None:
         )
 
     return "\n\n".join(parts)
-
 
 async def prepare_friday_highlights(cycle_key: str) -> None:
     await reconcile_pending_thanks(cycle_key)
@@ -3693,6 +4040,10 @@ async def prepare_friday_highlights(cycle_key: str) -> None:
             WHERE cycle_key=$1
               AND include_in_digest=1
               AND public_status IN ('pending', 'approved')
+        """, cycle_key)
+        public_count += await conn.fetchval("""
+            SELECT COUNT(*) FROM group_thanks
+            WHERE cycle_key=$1 AND status IN ('pending', 'approved')
         """, cycle_key)
 
     try:
@@ -3710,8 +4061,9 @@ async def prepare_friday_highlights(cycle_key: str) -> None:
 async def approve_digest(cycle_key: str, admin_id: int) -> tuple[bool, str]:
     await reconcile_pending_thanks(cycle_key)
     pending = await get_pending_public_moderation(cycle_key)
-    if pending:
-        return False, f"Сначала обработай модерацию: осталось {len(pending)}."
+    group_pending = await get_pending_group_moderation(cycle_key)
+    if pending or group_pending:
+        return False, f"Сначала обработай модерацию: осталось {len(pending) + group_pending}."
 
     assert pool is not None
     async with pool.acquire() as conn:
@@ -3960,6 +4312,11 @@ async def publish_approved_digest(cycle_key: str) -> bool:
                 WHERE cycle_key=$1
                   AND public_status='approved'
             """, cycle_key)
+            await conn.execute("""
+                UPDATE group_thanks
+                SET status='published'
+                WHERE cycle_key=$1 AND status='approved'
+            """, cycle_key)
 
     return True
 
@@ -4161,8 +4518,10 @@ async def get_admin_dashboard_counts(cycle_key: str) -> dict:
             "denied": await conn.fetchval("SELECT COUNT(*) FROM users WHERE status='access_denied'"),
             "deleted": await conn.fetchval("SELECT COUNT(*) FROM users WHERE status='self_deleted' OR deleted_at IS NOT NULL"),
             "ristretto": await conn.fetchval("SELECT COUNT(*) FROM weekly_participation WHERE cycle_key=$1 AND response='yes'", cycle_key),
-            "thanks": await conn.fetchval("SELECT COUNT(*) FROM thanks WHERE cycle_key=$1", cycle_key),
-            "public": await conn.fetchval("SELECT COUNT(*) FROM thanks WHERE cycle_key=$1 AND include_in_digest=1 AND public_status NOT IN ('removed','cancelled')", cycle_key),
+            "thanks": await conn.fetchval("SELECT COUNT(*) FROM thanks WHERE cycle_key=$1", cycle_key)
+                + await conn.fetchval("SELECT COUNT(*) FROM group_thanks WHERE cycle_key=$1", cycle_key),
+            "public": await conn.fetchval("SELECT COUNT(*) FROM thanks WHERE cycle_key=$1 AND include_in_digest=1 AND public_status NOT IN ('removed','cancelled')", cycle_key)
+                + await conn.fetchval("SELECT COUNT(*) FROM group_thanks WHERE cycle_key=$1 AND status <> 'removed'", cycle_key),
             "new_blocks": await conn.fetchval("SELECT COUNT(*) FROM thanks_blocks WHERE created_at >= date_trunc('week', NOW())"),
         }
 
@@ -4900,9 +5259,15 @@ async def get_admin_user_metrics(user_id: int, cycle_key: str) -> dict:
             "thanks_week": await conn.fetchval(
                 "SELECT COUNT(*) FROM thanks WHERE sender_id=$1 AND cycle_key=$2",
                 user_id, cycle_key,
+            ) + await conn.fetchval(
+                "SELECT COUNT(*) FROM group_thanks WHERE sender_id=$1 AND cycle_key=$2",
+                user_id, cycle_key,
             ),
             "thanks_total": await conn.fetchval(
                 "SELECT COUNT(*) FROM thanks WHERE sender_id=$1",
+                user_id,
+            ) + await conn.fetchval(
+                "SELECT COUNT(*) FROM group_thanks WHERE sender_id=$1",
                 user_id,
             ),
             "active_blocks": await conn.fetchval(
@@ -5442,10 +5807,15 @@ async def get_stats(cycle_key: str) -> dict:
             """),
             "thanks_week": await conn.fetchval("""
                 SELECT COUNT(*) FROM thanks WHERE cycle_key=$1
+            """, cycle_key) + await conn.fetchval("""
+                SELECT COUNT(*) FROM group_thanks WHERE cycle_key=$1
             """, cycle_key),
             "thanks_public_week": await conn.fetchval("""
                 SELECT COUNT(*) FROM thanks
                 WHERE cycle_key=$1 AND include_in_digest=1
+            """, cycle_key) + await conn.fetchval("""
+                SELECT COUNT(*) FROM group_thanks
+                WHERE cycle_key=$1 AND status <> 'removed'
             """, cycle_key),
         }
 
@@ -5807,6 +6177,54 @@ async def flow_message_handler(message: Message) -> None:
         await send_admin_user_card(message, target_id, message.from_user.id)
         return
 
+    group_flow = await get_flow(message.from_user.id)
+    if group_flow and group_flow["flow_type"] == "thanks_group":
+        user_allowed = user and user["status"] in {"active", "paused"} and user["deleted_at"] is None and user["removed_by_admin"] == 0
+        if not user_allowed:
+            await clear_flow(message.from_user.id)
+            await message.answer("Отправка благодарностей сейчас недоступна.")
+            return
+
+        if group_flow["step"] == "waiting_group":
+            if not 2 <= len(text) <= 80 or "\n" in text:
+                await message.answer("Название команды или группы: 2–80 символов, одной строкой.")
+                return
+            await set_flow(
+                message.from_user.id, "thanks_group", "waiting_text",
+                cycle_key=group_flow["cycle_key"], target_group=text,
+            )
+            await message.answer("Теперь напиши текст благодарности (до 3500 символов).")
+            return
+
+        if group_flow["step"] == "waiting_text":
+            if not 3 <= len(text) <= 3500:
+                await message.answer("Текст благодарности должен содержать от 3 до 3500 символов.")
+                return
+            await set_flow(
+                message.from_user.id, "thanks_group", "confirm",
+                cycle_key=group_flow["cycle_key"],
+                target_group=group_flow["target_group"], draft_text=text,
+            )
+            public_text = truncate_public_thanks(text)
+            cut_note = "\n\nТекст сокращён до 200 символов для дайджеста." if public_text != " ".join(text.split()) else ""
+            await message.answer(
+                "Предпросмотр благодарности команде\n\n"
+                f"Кому: {group_flow['target_group']}\n"
+                f"«{public_text}»"
+                f"{cut_note}\n\n"
+                "Публикация будет анонимной, только в дайджесте, после модерации. "
+                "Личного сообщения не будет. Отправить?",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="Отправить", callback_data="thanks_group_send")],
+                    [InlineKeyboardButton(text="Изменить текст", callback_data="thanks_group_edit")],
+                    [InlineKeyboardButton(text="Отмена", callback_data="thanks_group_cancel")],
+                ]),
+            )
+            return
+
+        await message.answer("Используй кнопки подтверждения или отмены под предпросмотром.")
+        return
+
     # Новый онбординг и одноразовая миграция профиля хранят текущий шаг в users,
     # поэтому переживают рестарт бота без потери прогресса.
     if user and (
@@ -5963,8 +6381,7 @@ async def flow_message_handler(message: Message) -> None:
             )
             await message.answer(
                 f"Нашёл: {clean_name(recipient['display_name'])}.\n\n"
-                "Напиши текст благодарности. Получатель увидит твоё имя "
-                "в личном сообщении."
+                "Напиши текст благодарности. Потом выберешь способ отправки."
             )
             return
 
@@ -5992,7 +6409,7 @@ async def flow_message_handler(message: Message) -> None:
         )
         await message.answer(
             "Как отправить спасибо?\n\n"
-            "В любом случае получатель увидит твоё имя в личном сообщении.",
+            "В анонимном дайджесте имя автора не показываем и личное сообщение не отправляем.",
             reply_markup=thanks_visibility_keyboard(),
         )
         return
