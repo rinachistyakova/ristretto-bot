@@ -4693,6 +4693,9 @@ async def get_admin_dashboard_counts(cycle_key: str) -> dict:
 
 
 async def send_admin_home(message: Message, user_id: int) -> None:
+    search_flow = await get_flow(user_id)
+    if search_flow and search_flow["flow_type"] == "admin_user_search":
+        await clear_flow(user_id)
     cycle_key = current_cycle()
     counts = await get_admin_dashboard_counts(cycle_key)
     role = "owner" if is_owner(user_id) else "admin"
@@ -5795,6 +5798,18 @@ async def send_admin_user_card(message: Message, user_id: int, viewer_id: int) -
         elif user["role"] == "user":
             buttons.append([InlineKeyboardButton(text="Сделать администратором", callback_data=f"admin_role_add:{user_id}")])
 
+    # Keep search controls close to the card opened from search results.
+    search_flow = await get_flow(viewer_id)
+    if search_flow and search_flow["flow_type"] == "admin_user_search" and search_flow["step"] == "results":
+        # The page is stored with the search state, not inferred from the card.
+        search_page = search_flow["cycle_key"] or "0"
+        if not search_page.isdecimal():
+            search_page = "0"
+        buttons.extend([
+            [InlineKeyboardButton(text="← К результатам поиска", callback_data=f"admin_user_search_page:{search_page}")],
+            [InlineKeyboardButton(text="Новый поиск", callback_data="admin_users_search")],
+        ])
+
     await message.answer(
         "Карточка пользователя\n\n"
         f"{profile_title(user)}\n"
@@ -5813,41 +5828,173 @@ async def send_admin_user_card(message: Message, user_id: int, viewer_id: int) -
     )
 
 
-async def send_users_list(message: Message, statuses: tuple[str, ...] | None = None) -> None:
+async def send_users_list(
+    message: Message,
+    statuses: tuple[str, ...] | None = None,
+    page: int = 0,
+) -> None:
+    """List admin-accessible users in Telegram-safe 15-item pages."""
+    if page < 0:
+        await message.answer("Некорректная страница.")
+        return
+
+    page_size = 15
     assert pool is not None
     async with pool.acquire() as conn:
         if statuses:
+            total = await conn.fetchval("""
+                SELECT COUNT(*) FROM users
+                WHERE status = ANY($1::text[])
+            """, list(statuses))
             users = await conn.fetch("""
-                SELECT * FROM users
+                SELECT user_id, display_name, username, status FROM users
                 WHERE status = ANY($1::text[])
                 ORDER BY LOWER(COALESCE(display_name, username, '')), user_id
-            """, list(statuses))
+                LIMIT $2 OFFSET $3
+            """, list(statuses), page_size, page * page_size)
         else:
+            total = await conn.fetchval("""
+                SELECT COUNT(*) FROM users WHERE status <> 'self_deleted'
+            """)
             users = await conn.fetch("""
-                SELECT * FROM users
+                SELECT user_id, display_name, username, status FROM users
                 WHERE status <> 'self_deleted'
                 ORDER BY LOWER(COALESCE(display_name, username, '')), user_id
-            """)
+                LIMIT $1 OFFSET $2
+            """, page_size, page * page_size)
 
-    if not users:
+    if not total:
         await message.answer("В этом разделе пока никого нет.")
         return
+    if page * page_size >= total:
+        await message.answer("Такой страницы нет. Открой список заново через /admin.")
+        return
 
+    prefix = "admin_denied_page" if statuses else "admin_users_page"
     rows = [
         [InlineKeyboardButton(
-            text=f"{clean_name(user['display_name'])} · {admin_status_label(user)}"[:60],
+            text=f"{clean_name(user['display_name'] or user['username'] or str(user['user_id']))} · {admin_status_label(user)}"[:60],
             callback_data=f"admin_user:{user['user_id']}",
         )]
         for user in users
     ]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            text="← Назад", callback_data=f"{prefix}:{page - 1}"
+        ))
+    if (page + 1) * page_size < total:
+        nav.append(InlineKeyboardButton(
+            text="Далее →", callback_data=f"{prefix}:{page + 1}"
+        ))
+    if nav:
+        rows.append(nav)
+    if not statuses:
+        rows.append([InlineKeyboardButton(
+            text="Найти сотрудника", callback_data="admin_users_search",
+        )])
     rows.append([InlineKeyboardButton(text="← В админку", callback_data="admin_home")])
-    await message.answer("Пользователи:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    section = "Доступ закрыт" if statuses else "Пользователи"
+    await message.answer(
+        f"{section}: {total}\n"
+        f"Страница {page + 1} из {(total + page_size - 1) // page_size}.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+async def send_admin_user_search_results(message: Message, admin_id: int, page: int = 0) -> None:
+    """Search employee cards using stored input; 15 results per page."""
+    flow = await get_flow(admin_id)
+    if (
+        not flow or flow["flow_type"] != "admin_user_search"
+        or flow["step"] != "results" or not flow["draft_text"]
+    ):
+        await message.answer(
+            "Поиск завершён. Открой «Пользователи» и нажми «Найти сотрудника»."
+        )
+        return
+    if page < 0:
+        await message.answer("Некорректная страница.")
+        return
+
+    query = flow["draft_text"]
+    page_size = 15
+    where_clause = """
+        status <> 'self_deleted'
+        AND (
+            STRPOS(LOWER(COALESCE(display_name, '')), LOWER($1)) > 0
+            OR STRPOS(LOWER(COALESCE(first_name, '')), LOWER($1)) > 0
+            OR STRPOS(LOWER(COALESCE(username, '')), LOWER($1)) > 0
+        )
+    """
+    assert pool is not None
+    async with pool.acquire() as conn:
+        total = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE " + where_clause, query,
+        )
+        users = await conn.fetch("""
+            SELECT user_id, display_name, first_name, username, status
+            FROM users
+            WHERE """ + where_clause + """
+            ORDER BY
+                CASE
+                    WHEN LOWER(COALESCE(username, '')) = LOWER($1) THEN 0
+                    WHEN LOWER(COALESCE(display_name, '')) = LOWER($1) THEN 1
+                    WHEN STRPOS(LOWER(COALESCE(display_name, '')), LOWER($1)) = 1 THEN 2
+                    ELSE 3
+                END,
+                LOWER(COALESCE(display_name, username, '')), user_id
+            LIMIT $2 OFFSET $3
+        """, query, page_size, page * page_size)
+
+    rows = []
+    for user in users:
+        name = clean_name(
+            user["display_name"] or user["first_name"]
+            or user["username"] or str(user["user_id"])
+        )
+        rows.append([InlineKeyboardButton(
+            text=f"{name} · {admin_status_label(user)}"[:60],
+            callback_data=f"admin_user:{user['user_id']}",
+        )])
+
+    if total and page * page_size < total:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(
+                text="← Назад", callback_data=f"admin_user_search_page:{page - 1}",
+            ))
+        if (page + 1) * page_size < total:
+            nav.append(InlineKeyboardButton(
+                text="Далее →", callback_data=f"admin_user_search_page:{page + 1}",
+            ))
+        if nav:
+            rows.append(nav)
+    elif total:
+        await message.answer("Такая страница больше недоступна. Повтори поиск.")
+        return
+
+    rows.extend([
+        [InlineKeyboardButton(text="Новый поиск", callback_data="admin_users_search")],
+        [InlineKeyboardButton(text="К списку сотрудников", callback_data="admin_users_search_exit")],
+    ])
+    header = (
+        f"По запросу «{query}» найдено: {total}.\n"
+        f"Страница {page + 1} из {(total + page_size - 1) // page_size}."
+        if total else f"По запросу «{query}» сотрудников не найдено."
+    )
+    # Remember which result page was last shown (uses existing user_flows.cycle_key).
+    await set_flow(admin_id, "admin_user_search", "results", cycle_key=str(page), draft_text=query)
+    await message.answer(header, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 @router.message(Command("users"))
 async def users_command(message: Message) -> None:
     if not await require_admin(message):
         return
+    current = await get_flow(message.from_user.id)
+    if current and current["flow_type"] == "admin_user_search":
+        await clear_flow(message.from_user.id)
     await send_users_list(message)
 
 
@@ -5856,6 +6003,89 @@ async def admin_users_menu_callback(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет доступа.", show_alert=True)
         return
+    current = await get_flow(callback.from_user.id)
+    if current and current["flow_type"] == "admin_user_search":
+        await clear_flow(callback.from_user.id)
+    await send_users_list(callback.message)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_users_page:"))
+async def admin_users_page_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        page = int(callback.data.rsplit(":", 1)[1])
+        if page < 0:
+            raise ValueError
+    except (ValueError, IndexError):
+        await callback.answer("Некорректная страница.", show_alert=True)
+        return
+    await send_users_list(callback.message, page=page)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_denied_page:"))
+async def admin_denied_page_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        page = int(callback.data.rsplit(":", 1)[1])
+        if page < 0:
+            raise ValueError
+    except (ValueError, IndexError):
+        await callback.answer("Некорректная страница.", show_alert=True)
+        return
+    await send_users_list(callback.message, ("access_denied",), page=page)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_users_search")
+async def admin_users_search_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    current = await get_flow(callback.from_user.id)
+    if current and current["flow_type"] == "admin_broadcast" and current["step"] in {"confirm", "sending", "retry"}:
+        await callback.answer("Сначала заверши текущую рассылку.", show_alert=True)
+        return
+    await set_flow(callback.from_user.id, "admin_user_search", "waiting_query")
+    await callback.message.answer(
+        "Напиши имя, фамилию или @username сотрудника.\n"
+        "Можно ввести часть имени — от 2 до 80 символов.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Отмена", callback_data="admin_users_search_exit")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_user_search_page:"))
+async def admin_user_search_page_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        page = int(callback.data.rsplit(":", 1)[1])
+        if page < 0:
+            raise ValueError
+    except (ValueError, IndexError):
+        await callback.answer("Некорректная страница.", show_alert=True)
+        return
+    await send_admin_user_search_results(callback.message, callback.from_user.id, page)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_users_search_exit")
+async def admin_users_search_exit_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    current = await get_flow(callback.from_user.id)
+    if current and current["flow_type"] == "admin_user_search":
+        await clear_flow(callback.from_user.id)
     await send_users_list(callback.message)
     await callback.answer()
 
@@ -6002,6 +6232,9 @@ async def admin_denied_menu_callback(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет доступа.", show_alert=True)
         return
+    current = await get_flow(callback.from_user.id)
+    if current and current["flow_type"] == "admin_user_search":
+        await clear_flow(callback.from_user.id)
     await send_users_list(callback.message, ("access_denied",))
     await callback.answer()
 
@@ -6521,6 +6754,24 @@ async def flow_message_handler(message: Message) -> None:
     user = await get_user(message.from_user.id)
 
     admin_flow = await get_flow(message.from_user.id)
+    if admin_flow and admin_flow["flow_type"] == "admin_user_search":
+        if not is_admin(message.from_user.id):
+            await clear_flow(message.from_user.id)
+            await message.answer("Нет доступа.")
+            return
+        if admin_flow["step"] == "waiting_query":
+            query = text.strip().lstrip("@").strip()
+            if not 2 <= len(query) <= 80 or "\n" in query:
+                await message.answer("Введи от 2 до 80 символов, одной строкой.")
+                return
+            await set_flow(
+                message.from_user.id, "admin_user_search", "results", draft_text=query,
+            )
+            await send_admin_user_search_results(message, message.from_user.id)
+            return
+        # A finished search must not swallow unrelated text messages.
+        await clear_flow(message.from_user.id)
+        admin_flow = None
     if admin_flow and admin_flow["flow_type"] == "admin_broadcast":
         if not is_admin(message.from_user.id):
             await clear_flow(message.from_user.id)
