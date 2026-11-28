@@ -13,6 +13,8 @@ import asyncpg
 from dotenv import load_dotenv
 
 from v2_foundation import ensure_v2_foundation
+from iteration2_ux import (NAME_PROMPT, NAME_ERROR, valid_full_name,
+                           SUGGESTION_MAX_LENGTH, latest_suggestion_due, suggestion_batches)
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
@@ -149,24 +151,25 @@ USER_BOT_COMMANDS = [
     BotCommand(command="leave", description="Поставить рассылки на паузу"),
     BotCommand(command="resume", description="Вернуть автоматические сообщения"),
     BotCommand(command="help", description="Что умеет бот"),
+    BotCommand(command="suggest", description="Предложить улучшение"),
     BotCommand(command="delete_me", description="Удалить профиль"),
 ]
 
 
 async def configure_bot_commands() -> None:
     """Keep the Telegram command menu aligned with the user's role."""
-    await bot.set_my_commands(
-        USER_BOT_COMMANDS,
-        scope=BotCommandScopeAllPrivateChats(),
-    )
+    try:
+        await bot.set_my_commands(USER_BOT_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+    except Exception:
+        logging.exception("Не удалось установить общее меню команд")
     admin_commands = USER_BOT_COMMANDS + [
         BotCommand(command="admin", description="Админка Random Ristretto"),
     ]
     for admin_id in ADMIN_USER_IDS:
-        await bot.set_my_commands(
-            admin_commands,
-            scope=BotCommandScopeChat(chat_id=admin_id),
-        )
+        try:
+            await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
+        except Exception:
+            logging.exception("Не удалось установить персональное меню команд для %s", admin_id)
 
 
 def user_help_text(user: asyncpg.Record | dict | None) -> str:
@@ -193,16 +196,31 @@ def user_help_text(user: asyncpg.Record | dict | None) -> str:
         if user["profile_migration_required"] == 1
         else ""
     )
+    name_note = (
+        "\n\nЕсли в профиле указано только имя, пожалуйста, добавь фамилию через /profile. "
+        "Так коллегам будет проще тебя найти."
+        if not valid_full_name(user["display_name"]) else ""
+    )
     return (
         f"{intro}\n\n"
-        "/thanks — поблагодарить коллегу\n"
+        "Знакомства: по понедельникам я спрашиваю, готов(а) ли ты к встрече. "
+        "Если согласишься, во вторник получишь контакт коллеги или небольшой группы и тему для разговора. "
+        "О времени встречи договоритесь сами.\n\n"
+        "Благодарности: по средам напоминаю о них. Можно отправить спасибо лично, "
+        "лично и анонимно в пятничный дайджест или только анонимно в дайджест. "
+        "Команду или группу можно поблагодарить в дайджесте. Публичные тексты проходят модерацию. "
+        "Личные благодарности и дайджест отправляются по пятницам.\n\n"
+        "Команды:\n"
+        "/start — открыть бота\n"
+        "/thanks — поблагодарить коллегу или команду\n"
         "/profile — посмотреть или изменить профиль\n"
         "/blocked — посмотреть и снять блокировки благодарностей\n"
-        "/leave — поставить автоматические сообщения на паузу\n"
+        "/leave — поставить автоматические сообщения на паузу, сохранив профиль\n"
         "/resume — вернуть автоматические сообщения\n"
+        "/suggest — предложить улучшение\n"
         "/help — показать эту памятку\n"
         "/delete_me — удалить профиль из бота"
-        f"{migration_note}"
+        f"{migration_note}{name_note}"
     )
 
 
@@ -270,7 +288,7 @@ def profile_title(user: asyncpg.Record | dict) -> str:
 def access_denied_message() -> str:
     return (
         "Сейчас не могу предоставить доступ к боту.\n\n"
-        "Попробуйте обратиться к коллегам из отдела PR и коммуникаций."
+        "Попробуй обратиться к коллегам из команды бренд-коммуникаций."
     )
 
 
@@ -503,6 +521,18 @@ async def init_db() -> None:
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_match_groups_cycle ON match_groups(cycle_key)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_thanks_cycle ON thanks(cycle_key)")
 
+        # Iteration 2: owner-only improvement suggestions, additive migration.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS improvement_suggestions (
+                id BIGSERIAL PRIMARY KEY,
+                author_id BIGINT,
+                body TEXT NOT NULL CHECK (char_length(body) BETWEEN 1 AND 1500),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                reported_at TIMESTAMPTZ
+            )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_improvement_suggestions_pending ON improvement_suggestions(created_at, id) WHERE reported_at IS NULL")
+
         # Random Ristretto v2: additive foundation only.
         # This does not switch the current user-facing UX to v2 yet.
         await ensure_v2_foundation(conn, ADMIN_ID)
@@ -694,21 +724,28 @@ async def complete_profile_setup(user_id: int) -> None:
 async def activate_pending_user(user_id: int) -> bool:
     assert pool is not None
     async with pool.acquire() as conn:
-        result = await conn.execute("""
-            UPDATE users
-            SET status='active',
-                active=1,
-                removed_by_admin=0,
-                activated_at=NOW(),
-                access_denied_at=NULL,
-                access_denied_reason=NULL,
-                updated_at=NOW()
-            WHERE user_id=$1
-              AND status='pending_activation'
-              AND onboarding_step='completed'
-              AND profile_migration_required=0
-        """, user_id)
-        return result.endswith("1")
+        async with conn.transaction():
+            pending = await conn.fetchrow(
+                "SELECT display_name, name_confirmed FROM users WHERE user_id=$1 AND status='pending_activation' FOR UPDATE",
+                user_id,
+            )
+            if not pending or pending['name_confirmed'] != 1 or not valid_full_name(pending['display_name']):
+                return False
+            result = await conn.execute("""
+                UPDATE users
+                SET status='active',
+                    active=1,
+                    removed_by_admin=0,
+                    activated_at=NOW(),
+                    access_denied_at=NULL,
+                    access_denied_reason=NULL,
+                    updated_at=NOW()
+                WHERE user_id=$1
+                  AND status='pending_activation'
+                  AND onboarding_step='completed'
+                  AND profile_migration_required=0
+            """, user_id)
+            return result == "UPDATE 1"
 
 
 async def deny_pending_user(user_id: int) -> bool:
@@ -788,6 +825,7 @@ async def anonymize_self(user_id: int) -> None:
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("DELETE FROM user_flows WHERE user_id=$1", user_id)
+            await conn.execute("UPDATE improvement_suggestions SET author_id=NULL WHERE author_id=$1", user_id)
             await conn.execute("""
                 UPDATE thanks
                 SET sender_name='Удалённый пользователь'
@@ -1358,12 +1396,12 @@ async def send_profile_step(message: Message, user: asyncpg.Record) -> None:
                 "в пятничный дайджест.\n\n"
                 "Для начала давай познакомимся.\n\n"
                 "Шаг 1 из 3:\n"
-                "Как тебя зовут? Напиши имя и фамилию."
+                f"{NAME_PROMPT}"
             )
         else:
             await message.answer(
                 "Шаг 1 из 3:\n"
-                "Как тебя зовут? Напиши имя и фамилию."
+                f"{NAME_PROMPT}"
             )
         return
 
@@ -1407,12 +1445,13 @@ async def show_profile(message: Message, user: asyncpg.Record) -> None:
     selected = next((row["name"] for row in teams if row["id"] == user["org_team_id"]), None)
     team_line = f"Команда: {selected or 'не выбрана'}\n" if teams else ""
 
+    name_note = "\n\nПожалуйста, добавь фамилию через «Изменить имя», чтобы коллегам было проще тебя найти." if not valid_full_name(user['display_name']) else ""
     await message.answer(
         "Твой профиль\n\n"
         f"{profile_title(user)}\n"
         f"{team_line}"
         f"Отвечает за: {responsibility}\n"
-        f"{username}",
+        f"{username}{name_note}",
         reply_markup=profile_actions_keyboard(show_org_teams=bool(teams)),
     )
 
@@ -1550,7 +1589,7 @@ async def start(message: Message) -> None:
             await send_profile_step(message, user)
         return
 
-    await message.answer(user_help_text(user))
+    await message.answer(user_help_text(user), reply_markup=suggestion_button() if suggestion_allowed(user) else None)
 
 
 @router.callback_query(F.data == "profile_migration_start")
@@ -1666,7 +1705,7 @@ async def profile_command(message: Message) -> None:
 @router.message(Command("help"))
 async def help_command(message: Message) -> None:
     user = await get_user(message.from_user.id)
-    await message.answer(user_help_text(user))
+    await message.answer(user_help_text(user), reply_markup=suggestion_button() if suggestion_allowed(user) else None)
 
 
 @router.message(Command("name"))
@@ -1858,6 +1897,9 @@ async def admin_activate_callback(callback: CallbackQuery) -> None:
         await callback.answer("Профиль не найден.", show_alert=True)
         return
 
+    if user['status'] == 'pending_activation' and (not valid_full_name(user['display_name']) or user['name_confirmed'] != 1):
+        await callback.answer("Нужно имя и фамилия. Верни профиль на доработку.", show_alert=True)
+        return
     activated = await activate_pending_user(user_id)
     if not activated:
         await callback.answer("Профиль уже обработан.", show_alert=True)
@@ -1881,7 +1923,17 @@ async def admin_activate_callback(callback: CallbackQuery) -> None:
             "Готово, доступ открыт.\n\n"
             "По понедельникам я буду спрашивать, готов(а) ли ты к Ristretto на этой неделе.\n"
             "По средам — напоминать, что можно отправить кому-нибудь спасибо.\n\n"
-            "Команды: /thanks, /profile, /blocked, /leave, /resume, /help"
+            "Команды:\n"
+            "/start — открыть бота\n"
+            "/thanks — поблагодарить коллегу или команду\n"
+            "/profile — мой профиль\n"
+            "/blocked — блокировки благодарностей\n"
+            "/leave — поставить рассылки на паузу\n"
+            "/resume — вернуть автоматические сообщения\n"
+            "/suggest — предложить улучшение\n"
+            "/help — инструкция\n"
+            "/delete_me — удалить профиль",
+            reply_markup=suggestion_button(),
         )
     except Exception:
         logging.exception("Не удалось сообщить пользователю об активации")
@@ -2459,10 +2511,12 @@ async def get_match_groups(cycle_key: str) -> list[dict]:
                 u.display_name,
                 u.team,
                 u.responsibility_text,
+                t.name AS org_team_name,
                 CASE WHEN n.user_id IS NULL THEN 0 ELSE 1 END AS notified
             FROM match_groups g
             JOIN match_group_members m ON m.group_id=g.id
             JOIN users u ON u.user_id=m.user_id
+            LEFT JOIN org_teams t ON t.id=u.org_team_id AND t.department_key=u.team AND t.is_active=TRUE
             LEFT JOIN match_notifications n
                 ON n.group_id=g.id AND n.user_id=u.user_id
             WHERE g.cycle_key=$1
@@ -2491,10 +2545,13 @@ async def mark_match_notified(group_id: int, user_id: int) -> None:
 
 
 def match_profile_block(user: asyncpg.Record | dict) -> str:
-    lines = [
-        profile_title(user),
-        f"Отвечает за: {(user['responsibility_text'] or '').strip()}",
-    ]
+    lines = [clean_name(user['display_name'])]
+    department = team_label(user['team'])
+    if department:
+        lines.append(f"Департамент: {department}")
+    if user.get('org_team_name'):
+        lines.append(f"Команда: {user['org_team_name']}")
+    lines.append(f"Отвечает за: {(user['responsibility_text'] or '').strip()}")
     if user["username"]:
         lines.append(f"@{user['username']}")
     return "\n".join(lines)
@@ -4667,6 +4724,7 @@ def admin_home_keyboard(owner: bool) -> InlineKeyboardMarkup:
     ]
     if owner:
         rows.extend([
+            [InlineKeyboardButton(text="Предложения по улучшению", callback_data="admin_suggestions:0")],
             [InlineKeyboardButton(text="Администраторы", callback_data="admin_roles_menu")],
             [InlineKeyboardButton(text="Аудит", callback_data="admin_audit_menu")],
             [InlineKeyboardButton(text="Состояние бота", callback_data="admin_bot_state")],
@@ -5259,7 +5317,7 @@ async def admin_profile_field_callback(callback: CallbackQuery) -> None:
         )
     else:
         prompt = (
-            "Введи новое имя и фамилию сотрудника (2–80 символов)."
+            "Введи имя и фамилию сотрудника (до 80 символов, одной строкой)."
             if field == "name"
             else "Введи, за что отвечает сотрудник (3–150 символов)."
         )
@@ -6742,6 +6800,179 @@ async def thanks_reminder_now_command(message: Message) -> None:
 
 
 # =========================================================
+# ПРЕДЛОЖЕНИЯ ПО УЛУЧШЕНИЮ (ИТЕРАЦИЯ 2)
+# =========================================================
+def suggestion_allowed(user) -> bool:
+    return bool(user and user['status'] in {'active', 'paused'}
+                and user['deleted_at'] is None and user['removed_by_admin'] == 0)
+
+
+def suggestion_button() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='Предложить улучшение', callback_data='suggestion_start')],
+    ])
+
+
+async def begin_suggestion(message: Message, user_id: int) -> bool:
+    user = await get_user(user_id)
+    if not suggestion_allowed(user):
+        await message.answer(user_help_text(user))
+        return False
+    await set_flow(user_id, 'improvement_suggestion', 'waiting_text')
+    await message.answer(
+        'Есть идея, как сделать Random Ristretto лучше?\n\n'
+        'Расскажи, что стоит изменить, добавить или упростить.\n'
+        f'До {SUGGESTION_MAX_LENGTH} символов. Предложение увидит владелец бота.',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text='Отмена', callback_data='suggestion_cancel')],
+        ]),
+    )
+    return True
+
+
+@router.message(Command('suggest'))
+async def suggestion_command(message: Message) -> None:
+    await begin_suggestion(message, message.from_user.id)
+
+
+@router.callback_query(F.data == 'suggestion_start')
+async def suggestion_start_callback(callback: CallbackQuery) -> None:
+    await begin_suggestion(callback.message, callback.from_user.id)
+    await callback.answer()
+
+
+@router.callback_query(F.data == 'suggestion_cancel')
+async def suggestion_cancel_callback(callback: CallbackQuery) -> None:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM user_flows WHERE user_id=$1 AND flow_type='improvement_suggestion'", callback.from_user.id)
+    await callback.answer('Предложение отменено.' if result == 'DELETE 1' else 'Этот диалог уже завершён.')
+    if result == 'DELETE 1':
+        await callback.message.answer('Предложение отменено. Вернуться можно через /suggest.')
+
+
+async def save_suggestion(user_id: int, text: str) -> bool:
+    # Lock the flow first (same lock order as profile deletion) so retries cannot save twice.
+    assert pool is not None
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            flow = await conn.fetchrow('SELECT flow_type, step FROM user_flows WHERE user_id=$1 FOR UPDATE', user_id)
+            if not flow or flow['flow_type'] != 'improvement_suggestion' or flow['step'] != 'waiting_text':
+                return False
+            user = await conn.fetchrow('SELECT * FROM users WHERE user_id=$1 FOR UPDATE', user_id)
+            if not suggestion_allowed(user):
+                await conn.execute('DELETE FROM user_flows WHERE user_id=$1', user_id)
+                return False
+            await conn.execute('INSERT INTO improvement_suggestions (author_id, body) VALUES ($1, $2)', user_id, text)
+            await conn.execute('DELETE FROM user_flows WHERE user_id=$1', user_id)
+            return True
+
+
+def suggestion_entry(row) -> str:
+    name = clean_name(row['display_name']) if row['author_id'] is not None else 'Удалённый пользователь'
+    org = ' · '.join(x for x in (team_label(row['department_key']), row['org_team_name']) if x)
+    date = row['created_at'].astimezone(TZ).strftime('%d.%m.%Y %H:%M')
+    return f"№{row['id']} · {date}\n{name}" + (f'\n{org}' if org else '') + f"\n{row['body']}"
+
+
+SUGGESTION_SELECT = """
+    SELECT s.id, s.author_id, s.body, s.created_at, s.reported_at,
+           u.display_name, u.team AS department_key, t.name AS org_team_name
+    FROM improvement_suggestions s
+    LEFT JOIN users u ON u.user_id=s.author_id
+    LEFT JOIN org_teams t ON t.id=u.org_team_id AND t.department_key=u.team
+"""
+
+
+async def send_suggestion_archive(message: Message, owner_id: int, offset: int = 0) -> None:
+    if not is_owner(owner_id):
+        return
+    assert pool is not None
+    async with pool.acquire() as conn:
+        async with conn.transaction(isolation='repeatable_read', readonly=True):
+            total = await conn.fetchval('SELECT COUNT(*) FROM improvement_suggestions')
+            pending = await conn.fetchval('SELECT COUNT(*) FROM improvement_suggestions WHERE reported_at IS NULL')
+            offset = min(max(offset, 0), max(total - 1, 0))
+            row = await conn.fetchrow(SUGGESTION_SELECT + ' ORDER BY s.id DESC LIMIT 1 OFFSET $1', offset)
+    text = f'Предложения по улучшению Random Ristretto\nВсего: {total} · ещё не в сводке: {pending}'
+    buttons = []
+    if row:
+        status = 'Включено в сводку' if row['reported_at'] else 'Новое, ещё не в сводке'
+        text += f'\n\n{offset + 1} из {total} · {status}\n\n' + suggestion_entry(row)
+        nav = []
+        if offset > 0:
+            nav.append(InlineKeyboardButton(text='← Новее', callback_data=f'admin_suggestions:{offset-1}'))
+        if offset + 1 < total:
+            nav.append(InlineKeyboardButton(text='Старее →', callback_data=f'admin_suggestions:{offset+1}'))
+        if nav:
+            buttons.append(nav)
+    else:
+        text += '\n\nПредложений пока нет.'
+    if total:
+        buttons.append([InlineKeyboardButton(text='Получить весь архив', callback_data='admin_suggestions_all')])
+    buttons.append([InlineKeyboardButton(text='В админку', callback_data='admin_home')])
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data == 'admin_suggestions_all')
+async def admin_suggestions_all_callback(callback: CallbackQuery) -> None:
+    if not is_owner(callback.from_user.id):
+        await callback.answer('Нет доступа.', show_alert=True)
+        return
+    await callback.answer()
+    assert pool is not None
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(SUGGESTION_SELECT + ' ORDER BY s.id')
+    if not rows:
+        await callback.message.answer('Предложений пока нет.')
+        return
+    batches = suggestion_batches([(row['id'], suggestion_entry(row)) for row in rows])
+    for i, batch in enumerate(batches, 1):
+        header = f'Архив предложений · всего: {len(rows)} · часть {i} из {len(batches)}\n\n'
+        await safe_send_message(ADMIN_ID, header + '\n\n'.join(entry[1] for entry in batch))
+
+
+@router.callback_query(F.data.startswith('admin_suggestions:'))
+async def admin_suggestions_callback(callback: CallbackQuery) -> None:
+    if not is_owner(callback.from_user.id):
+        await callback.answer('Нет доступа.', show_alert=True)
+        return
+    page = callback.data.split(':', 1)[1]
+    if not page.isascii() or not page.isdecimal() or len(page) > 10:
+        await callback.answer('Некорректная страница.', show_alert=True)
+        return
+    await send_suggestion_archive(callback.message, callback.from_user.id, int(page))
+    await callback.answer()
+
+
+async def send_suggestion_summary(cutoff: datetime) -> None:
+    # No per-suggestion notifications. A successful Telegram send marks exactly that batch.
+    assert pool is not None
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(SUGGESTION_SELECT + ' WHERE s.reported_at IS NULL AND s.created_at < $1 ORDER BY s.id', cutoff)
+    if not rows:
+        return
+    batches = suggestion_batches([(row['id'], suggestion_entry(row)) for row in rows])
+    for i, batch in enumerate(batches, 1):
+        header = (
+            'Предложения по улучшению Random Ristretto\n'
+            f'Сводка на {cutoff:%d.%m.%Y} · новых предложений: {len(rows)}\n'
+            f'Часть {i} из {len(batches)}\n\n'
+        )
+        await safe_send_message(ADMIN_ID, header + '\n\n'.join(entry[1] for entry in batch))
+        async with pool.acquire() as conn:
+            await conn.execute('UPDATE improvement_suggestions SET reported_at=NOW() WHERE id=ANY($1::bigint[]) AND reported_at IS NULL', [entry[0] for entry in batch])
+
+
+async def run_due_suggestion_summary(now: datetime) -> None:
+    cutoff = latest_suggestion_due(now)
+    key = cutoff.strftime('%Y-%m-%d')
+    if await get_job_status('improvement_suggestions_summary', key) == 'completed':
+        return
+    await run_job_once('improvement_suggestions_summary', key, lambda: send_suggestion_summary(cutoff))
+
+
+# =========================================================
 # ОБРАБОТКА ТЕКСТА ВНУТРИ ДИАЛОГА
 # =========================================================
 @router.message()
@@ -6754,6 +6985,19 @@ async def flow_message_handler(message: Message) -> None:
     user = await get_user(message.from_user.id)
 
     admin_flow = await get_flow(message.from_user.id)
+    if admin_flow and admin_flow['flow_type'] == 'improvement_suggestion':
+        if not suggestion_allowed(user):
+            await clear_flow(message.from_user.id)
+            await message.answer(user_help_text(user))
+            return
+        if not 1 <= len(text) <= SUGGESTION_MAX_LENGTH:
+            await message.answer(f'Напиши предложение длиной до {SUGGESTION_MAX_LENGTH} символов.')
+            return
+        if await save_suggestion(message.from_user.id, text):
+            await message.answer('Спасибо за предложение! Мы сохранили его и учтём при дальнейшей работе над ботом.')
+        else:
+            await message.answer('Этот диалог уже завершён. Начать снова можно через /suggest.')
+        return
     if admin_flow and admin_flow["flow_type"] == "admin_user_search":
         if not is_admin(message.from_user.id):
             await clear_flow(message.from_user.id)
@@ -6886,8 +7130,8 @@ async def flow_message_handler(message: Message) -> None:
             await message.answer("Карточка больше недоступна.")
             return
         if admin_flow["step"] == "waiting_name":
-            if not 2 <= len(text) <= 80 or "\n" in text:
-                await message.answer("Имя должно содержать 2–80 символов, без переноса строк.")
+            if not valid_full_name(text):
+                await message.answer(NAME_ERROR)
                 return
             await set_display_name(target_id, text)
             action = "admin_edit_name"
@@ -7038,9 +7282,9 @@ async def flow_message_handler(message: Message) -> None:
         step = user["onboarding_step"]
 
         if step == "name":
-            if len(text) < 2 or len(text) > 80 or "\n" in text:
+            if not valid_full_name(text):
                 await message.answer(
-                    "Имя должно содержать от 2 до 80 символов. Попробуй ещё раз."
+                    NAME_ERROR
                 )
                 return
 
@@ -7094,9 +7338,9 @@ async def flow_message_handler(message: Message) -> None:
         return
 
     if flow["flow_type"] == "profile_edit" and flow["step"] == "waiting_name":
-        if len(text) < 2 or len(text) > 80 or "\n" in text:
+        if not valid_full_name(text):
             await message.answer(
-                "Имя должно содержать от 2 до 80 символов. Попробуй ещё раз."
+                NAME_ERROR
             )
             return
 
@@ -7129,9 +7373,9 @@ async def flow_message_handler(message: Message) -> None:
 
     if flow["flow_type"] == "set_name" and flow["step"] == "waiting_name":
         # Совместимость со старым незавершённым диалогом изменения имени.
-        if len(text) < 2 or len(text) > 80 or "\n" in text:
+        if not valid_full_name(text):
             await message.answer(
-                "Имя должно содержать от 2 до 80 символов. Попробуй ещё раз."
+                NAME_ERROR
             )
             return
 
@@ -7289,6 +7533,11 @@ async def scheduler_should_attempt(job_name: str, cycle_key: str, moment: dateti
 async def run_due_scheduler_jobs(moment: datetime | None = None) -> None:
     now = moment or datetime.now(TZ)
     cycle_key = current_cycle(now)
+
+    try:
+        await run_due_suggestion_summary(now)
+    except Exception:
+        logging.exception('Не удалось отправить сводку предложений')
 
     jobs = [
         ("random_checkin", lambda: send_weekly_checkin(cycle_key)),
